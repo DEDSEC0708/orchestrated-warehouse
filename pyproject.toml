@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volthive-warehouse"
+version = "0.1.0"
+description = "Orchestrated Warehouse - a local, production-style batch data platform for EV charging analytics (VoltHive Energy, fictional)"
+readme = "README.md"
+requires-python = "==3.11.*"
+license = { file = "LICENSE" }
+authors = [{ name = "Orchestrated Warehouse project" }]
+keywords = ["data-engineering", "airflow", "postgresql", "data-warehouse", "etl", "elt"]
+# Runtime dependencies are declared in requirements.txt so that they can be
+# installed together with the official Airflow constraints file. Duplicating
+# them here would create a second source of truth.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["volthive*"]
+# NOTE: src/volthive is created in Phase 1. Until then this finds zero packages,
+# which is valid - `pip install -e .` installs project metadata only.
+
+# ---------------------------------------------------------------------------
+# ruff - linter + formatter (single tool, replaces flake8/isort/black)
+# Version is pinned by constraints.txt (0.5.5). See ADR-013.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests", "dags"]
+exclude = [".git", ".venv", "__pycache__", "build", "dist", "data"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort - import ordering
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear - real bug patterns
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib
+    "RET",  # flake8-return
+    "ARG",  # unused arguments
+    "DTZ",  # flake8-datetimez - naive datetimes are a bug in a UTC-first warehouse
+    "T20",  # flake8-print - no stray print() in pipeline code; use structlog
+    "S",    # flake8-bandit - includes hardcoded-password detection (S105/S106)
+    "RUF",
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert, hardcode obviously-fake credentials, and print.
+"tests/**/*.py" = ["S101", "S105", "S106", "T20", "ARG001", "ARG002"]
+# Airflow DAG files legitimately execute code at import time.
+"dags/**/*.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["volthive"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"   # containers are Linux; never emit CRLF from the formatter
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config -ra"
+markers = [
+    "unit: fast, no external dependencies, everything I/O is mocked",
+    "dags: Airflow DAG integrity checks - imports only, no database",
+    "integration: requires a real PostgreSQL instance",
+    "e2e: full pipeline run, including the idempotency proof",
+]
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = ["*/__init__.py", "*/mock_partner_api/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+# ---------------------------------------------------------------------------
+# mypy - wired into `make typecheck` from Phase 1, when src/volthive exists
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+disallow_untyped_defs = false   # tightened to true once the package stabilises

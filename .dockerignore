@@ -1,0 +1,34 @@
+# Keep the Airflow image small and its build cache stable.
+# Anything listed here is NOT sent to the Docker daemon as build context.
+
+.git
+.github
+.gitignore
+.gitattributes
+
+# Never bake secrets into an image layer
+.env
+.env.*
+!.env.example
+
+# Generated data is bind-mounted at runtime, not copied into the image
+data/
+logs/
+
+# Not needed to run the pipeline
+docs/
+tests/
+scripts/
+*.md
+!README.md
+
+# Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/

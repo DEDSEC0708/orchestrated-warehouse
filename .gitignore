@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Secrets - NEVER commit these. .env.example is the committed template.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ---------------------------------------------------------------------------
+# Generated data - the landing zone is produced by the seeded generator and is
+# fully reproducible, so it must not be committed. data/seed/ IS committed
+# (it is source S5, a small static reference file authored by hand).
+# ---------------------------------------------------------------------------
+data/*
+!data/seed/
+!data/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Airflow runtime artefacts
+# ---------------------------------------------------------------------------
+logs/
+airflow.db
+airflow.cfg
+airflow-webserver.pid
+standalone_admin_password.txt
+webserver_config.py
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# ---------------------------------------------------------------------------
+# Test / tooling caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

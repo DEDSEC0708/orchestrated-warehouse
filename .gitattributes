@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Line-ending policy.
+#
+# WHY THIS FILE EXISTS: this repository is developed on Windows and executed
+# inside Linux containers. If a shell script or a Postgres init script is
+# committed with CRLF endings, the container fails with a confusing
+# "exec format error" or "no such file or directory" - because the kernel
+# treats the trailing \r as part of the interpreter path.
+#
+# Normalising to LF in the repository prevents that class of bug entirely.
+# ---------------------------------------------------------------------------
+
+# Normalise everything text-like to LF in the repository.
+* text=auto eol=lf
+
+# Files that MUST be LF because Linux executes them.
+*.sh        text eol=lf
+*.sql       text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+.env.example text eol=lf
+
+# Windows-only helpers, if any are ever added.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Binary - never touch these.
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.gz        binary
+*.zip       binary
+*.parquet   binary

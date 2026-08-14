@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# ORCHESTRATED WAREHOUSE - development / test / lint dependencies
+#
+# ALWAYS install with the same constraints file as the runtime deps:
+#     pip install -r requirements-dev.txt -c constraints.txt
+#
+# Deliberate choice: the dev toolchain is governed by the SAME Airflow
+# constraints file as the runtime, so the whole environment has exactly one
+# source of truth and one `pip install` can never produce a conflict.
+# That means ruff 0.5.5 and mypy 1.9.0 rather than the newest releases.
+# Trade-off accepted and recorded in docs/adr/013-dependency-pinning.md.
+#
+# Versions marked "(constraints)" are pinned by constraints.txt, so they are
+# intentionally left unpinned here - re-pinning them would duplicate the pin.
+# ---------------------------------------------------------------------------
+
+-r requirements.txt
+
+# --- Test runner -----------------------------------------------------------
+pytest             # (constraints) 8.3.4
+pytest-cov         # (constraints) 6.0.0
+pytest-mock        # (constraints) 3.14.0
+
+# --- Test doubles ----------------------------------------------------------
+freezegun==1.5.3   # frozen clock for watermark / freshness tests
+respx==0.22.0      # httpx transport mocking for the partner API client
+
+# --- Lint / format / types -------------------------------------------------
+ruff               # (constraints) 0.5.5 - linter + formatter
+mypy               # (constraints) 1.9.0
+types-PyYAML       # (constraints) 6.0.12.20241230
+sqlfluff==3.4.2    # SQL linter (not an Airflow dependency, so pinned here)
+
+# --- Git hooks -------------------------------------------------------------
+# NOTE: the constraints file lists this under its normalised name `pre_commit`
+# (underscore). It is therefore constraint-governed and must NOT be re-pinned
+# here - doing so produced a hard ResolutionImpossible during Phase 0 validation.
+pre-commit         # (constraints) 4.1.0

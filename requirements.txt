@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# ORCHESTRATED WAREHOUSE - runtime dependencies
+#
+# ALWAYS install with the pinned constraints file:
+#     pip install -r requirements.txt -c constraints.txt
+#
+# constraints.txt is the OFFICIAL Apache Airflow constraints file for
+# Airflow 2.10.5 on Python 3.11. It pins ~760 transitive packages to the exact
+# versions Airflow was released and tested against. Installing Airflow without
+# it is the single most common cause of a broken Airflow environment.
+#
+# Packages already pinned by constraints.txt are NOT re-pinned here (that would
+# create two sources of truth). Packages that Airflow does not depend on are
+# pinned explicitly below, era-matched to the Airflow 2.10.5 release window.
+# See docs/adr/013-dependency-pinning.md.
+# ---------------------------------------------------------------------------
+
+# --- Orchestration ---------------------------------------------------------
+# Pinned exactly. See docs/adr/012-airflow-version.md for why 2.10.5 and not 3.x.
+apache-airflow==2.10.5
+apache-airflow-providers-postgres==6.0.0
+
+# --- Database access -------------------------------------------------------
+# psycopg 3 is used by our own pipeline code (src/volthive) for COPY-based bulk
+# loading and server-side cursors. The Postgres provider above brings psycopg2
+# for Airflow's own hooks/connections - both drivers coexist deliberately.
+psycopg[binary]==3.2.13
+
+# --- Configuration ---------------------------------------------------------
+pydantic-settings==2.8.1
+PyYAML==6.0.2
+
+# --- Observability ---------------------------------------------------------
+structlog==25.4.0
+
+# --- HTTP client for the roaming partner source (S4) -----------------------
+# httpx is pinned by constraints.txt (0.27.0); tenacity supplies retry policy.
+httpx
+tenacity==9.0.0
+
+# --- Local mock partner API (source S4 local server) -----------------------
+# Runs from the SAME image as Airflow, as a separate compose service under the
+# optional "with-api" profile. No extra image, no extra build.
+fastapi==0.115.14
+uvicorn==0.34.3

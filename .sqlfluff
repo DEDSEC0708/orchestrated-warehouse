@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# sqlfluff - SQL linter.
+#
+# This project keeps ALL set-based logic in .sql files rather than in Python
+# strings, specifically so it can be linted, diffed and run directly in psql.
+# That only pays off if the SQL is held to a consistent style, hence this file.
+#
+# Rules are intentionally conservative in Phase 0 and tightened in Phase 3,
+# when the first real DDL lands and the house style is visible on real code.
+# ---------------------------------------------------------------------------
+
+[sqlfluff]
+dialect = postgres
+templater = jinja
+max_line_length = 120
+# Keep output actionable rather than exhaustive while the SQL surface is small.
+large_file_skip_byte_limit = 30000
+
+[sqlfluff:indentation]
+indented_joins = false
+indented_using_on = true
+tab_space_size = 4
+
+# Our SQL files are parameterised with psycopg named placeholders (:run_id).
+# Tell the Jinja templater to leave unknown constructs alone rather than fail.
+[sqlfluff:templater:jinja]
+apply_dbt_builtins = false
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = upper
+
+[sqlfluff:rules:aliasing.table]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.column]
+aliasing = explicit
+
+[sqlfluff:rules:ambiguous.column_references]
+group_by_and_order_by_style = explicit
