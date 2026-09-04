@@ -1,0 +1,197 @@
+# ===========================================================================
+# sources.yml - the contract between this platform and each source.
+#
+# EXPLICIT COLUMN LISTS, NEVER `SELECT *`. This is the single most important
+# thing in this file. With an explicit list:
+#
+#   * a column ADDED upstream is ignored until someone declares it, so a
+#     schema change cannot silently alter the shape of a raw table;
+#   * a column REMOVED upstream fails the extract immediately with
+#     "column does not exist", which is a ContractError - loud, at extract
+#     time, before any wrong data reaches the warehouse.
+#
+# With `SELECT *`, the first case silently changes raw and the second silently
+# produces NULLs downstream. A failed run is visible; wrong data is not.
+#
+# `source_table` names the `_history` table for the CMS entities. See
+# sql/source/00_cms_ddl.sql for why the simulator exposes both a current-state
+# and a history table, and for the honest caveat about what a real OLTP would
+# give you instead.
+# ===========================================================================
+
+cms:
+  connection: cms
+  entities:
+    customers:
+      source_table: customers_history
+      current_table: customers
+      target_table: raw.cms_customers
+      natural_key: [customer_id]
+      watermark_column: updated_at
+      columns:
+        - customer_id
+        - full_name
+        - email
+        - phone
+        - city
+        - state
+        - customer_segment
+        - subscription_plan
+        - kyc_status
+        - signup_date
+        - is_active
+        - created_at
+        - updated_at
+
+    vehicles:
+      source_table: vehicles_history
+      current_table: vehicles
+      target_table: raw.cms_vehicles
+      natural_key: [vehicle_id]
+      watermark_column: updated_at
+      columns:
+        - vehicle_id
+        - customer_id
+        - make
+        - model
+        - model_year
+        - battery_capacity_kwh
+        - connector_type
+        - registration_state
+        - created_at
+        - updated_at
+
+    stations:
+      source_table: stations_history
+      current_table: stations
+      target_table: raw.cms_stations
+      natural_key: [station_id]
+      watermark_column: updated_at
+      columns:
+        - station_id
+        - station_name
+        - address_line
+        - city
+        - state
+        - pincode
+        - latitude
+        - longitude
+        - site_type
+        - commissioned_date
+        - num_bays
+        - operator_name
+        - is_active
+        - created_at
+        - updated_at
+
+    charge_points:
+      source_table: charge_points_history
+      current_table: charge_points
+      target_table: raw.cms_charge_points
+      natural_key: [charge_point_id]
+      watermark_column: updated_at
+      columns:
+        - charge_point_id
+        - station_id
+        - oem_vendor
+        - model
+        - current_type
+        - rated_power_kw
+        - connector_type
+        - tariff_plan_id
+        - firmware_version
+        - status
+        - commissioned_date
+        - created_at
+        - updated_at
+
+    tariff_plans:
+      source_table: tariff_plans_history
+      current_table: tariff_plans
+      target_table: raw.cms_tariff_plans
+      natural_key: [tariff_plan_id]
+      watermark_column: updated_at
+      columns:
+        - tariff_plan_id
+        - plan_name
+        - price_per_kwh_inr
+        - price_per_minute_inr
+        - idle_fee_per_minute_inr
+        - min_billable_kwh
+        - gst_rate_pct
+        - valid_from_date
+        - is_active
+        - created_at
+        - updated_at
+
+files:
+  ocpp_cdr:
+    landing_subdir: cdr
+    file_glob: "*.jsonl"
+    format: jsonl
+    target_table: raw.ocpp_cdr
+    source_system: OCPP
+    # Promoted out of the JSON payload into real columns so that dedupe joins
+    # and restatement deletes do not have to unwrap JSONB on every row. The
+    # payload remains the source of truth for everything else.
+    promoted:
+      transaction_id: transaction_id
+      charge_point_id: charge_point_id
+      start_timestamp_txt: start_timestamp
+      record_version: record_version
+
+  meter_value:
+    landing_subdir: meter
+    file_glob: "*.csv.gz"
+    format: csv_gz
+    target_table: raw.meter_value
+    source_system: METER
+    columns:
+      - sample_id
+      - transaction_id
+      - charge_point_id
+      - sample_timestamp
+      - energy_register_wh
+      - power_kw
+      - soc_percent
+      - voltage_v
+      - current_a
+      - temperature_c
+
+  partner_cdr:
+    landing_subdir: partner
+    file_glob: "*.jsonl"
+    format: jsonl
+    target_table: raw.partner_cdr
+    source_system: PARTNER
+    promoted:
+      cdr_id: cdr_id
+      partner_code: partner_code
+      last_updated_txt: last_updated
+
+seed:
+  grid_tariff_slab:
+    path: data/seed/grid_tariff_slabs.csv
+    target_table: raw.grid_tariff_slab
+    source_system: SEED
+    # FULL SNAPSHOT, deliberately. Sixty rows of slowly-changing reference data
+    # are cheaper and safer to reload wholesale than to reason about
+    # incrementally. "Incremental everywhere" is dogma, not engineering.
+    load_strategy: full_snapshot
+    columns:
+      - state
+      - effective_from_date
+      - effective_to_date
+      - slab_name
+      - commercial_rate_inr_per_kwh
+      - source_note
+
+partner_api:
+  base_path: /ocpi/2.2/cdrs
+  page_size: 500
+  # A hard cap on pages. Without one, a server that never advances its cursor -
+  # or that misreports `total` - turns a five-minute task into an infinite
+  # loop that holds a worker slot until someone notices.
+  max_pages: 200
+  request_timeout_seconds: 15
+  max_retries: 4

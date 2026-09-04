@@ -1,0 +1,276 @@
+# =============================================================================
+# ORCHESTRATED WAREHOUSE - local infrastructure
+#
+# Four services: one PostgreSQL, one one-shot Airflow bootstrap, one Airflow
+# scheduler, one Airflow webserver. Nothing else.
+#
+# There is no Redis and no Celery worker because the executor is LocalExecutor,
+# and there is no triggerer because no deferrable operator is used. Both are
+# decisions with reasons, recorded in docs/adr/006-executor-and-topology.md,
+# not omissions.
+#
+# Every value comes from .env (see .env.example). No credential appears here.
+#
+#   make up      build, start, wait for health
+#   make ps      show status and health of every service
+#   make down    stop, keeping the data volume
+#   make clean   stop and DELETE the data volume
+# =============================================================================
+name: volthive
+
+# --- shared Airflow configuration -------------------------------------------
+# All three Airflow services run the same image with the same environment and
+# differ only in their command. The anchor keeps them from drifting apart.
+x-airflow-common: &airflow-common
+  image: volthive/airflow:2.10.5-local
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  # UID must match the host user on Linux, or bind-mounted files become
+  # root-owned and undeletable. Group 0 is what the base image expects.
+  # Docker Desktop on Windows and macOS handles ownership itself.
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-env
+    # --- core ---------------------------------------------------------------
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}
+    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES:-False}
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-8}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-6}
+    # Airflow runs in UTC. Business dates are derived in Asia/Kolkata inside the
+    # warehouse, never by shifting the scheduler's clock.
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: ${AIRFLOW__CORE__DEFAULT_TIMEZONE:-utc}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?run scripts/generate_env.sh to generate a Fernet key}
+
+    # --- metadata database ---------------------------------------------------
+    # Composed from the individual role variables so the password exists in
+    # exactly one place in .env. Dev passwords must be URL-safe; the template in
+    # .env.example is.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}@postgres:5432/${AIRFLOW_DB:-airflow}
+
+    # --- webserver -----------------------------------------------------------
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?run scripts/generate_env.sh to generate a secret key}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG:-False}
+
+    # --- connections, injected as environment URIs ---------------------------
+    # Never added to the metadata database with `airflow connections add`: that
+    # would store a second, Fernet-encrypted copy of each password whose key
+    # also lives in .env. One copy is easier to rotate and easier to reason
+    # about. Airflow reads any AIRFLOW_CONN_<ID> variable as a connection.
+    AIRFLOW_CONN_WAREHOUSE_DB: >-
+      postgresql://${WH_ETL_USER:-wh_etl}:${WH_ETL_PASSWORD:?set WH_ETL_PASSWORD in .env}@postgres:5432/${WH_DB:-warehouse}
+    AIRFLOW_CONN_CMS_DB: >-
+      postgresql://${CMS_READER_USER:-cms_reader}:${CMS_READER_PASSWORD:?set CMS_READER_PASSWORD in .env}@postgres:5432/${CMS_DB:-cms}
+
+    # --- application ---------------------------------------------------------
+    # Read by src/volthive/config/settings.py.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    WH_DB: ${WH_DB:-warehouse}
+    CMS_DB: ${CMS_DB:-cms}
+    WH_ETL_USER: ${WH_ETL_USER:-wh_etl}
+    WH_ETL_PASSWORD: ${WH_ETL_PASSWORD}
+    CMS_READER_USER: ${CMS_READER_USER:-cms_reader}
+    CMS_READER_PASSWORD: ${CMS_READER_PASSWORD}
+    VOLTHIVE_ENV: ${VOLTHIVE_ENV:-local}
+    VOLTHIVE_LOG_LEVEL: ${VOLTHIVE_LOG_LEVEL:-INFO}
+    VOLTHIVE_LOG_JSON: ${VOLTHIVE_LOG_JSON:-true}
+    VOLTHIVE_DATA_DIR: /opt/airflow/data
+    VOLTHIVE_CONFIG_DIR: /opt/airflow/configs
+    VOLTHIVE_PARTNER_MODE: ${VOLTHIVE_PARTNER_MODE:-file}
+    VOLTHIVE_GENERATOR_SEED: ${VOLTHIVE_GENERATOR_SEED:-42}
+    VOLTHIVE_GENERATOR_PROFILE: ${VOLTHIVE_GENERATOR_PROFILE:-default}
+    PYTHONPATH: /opt/airflow/src
+  volumes:
+    # Read-only wherever the container has no business writing.
+    - ./dags:/opt/airflow/dags:ro
+    - ./src:/opt/airflow/src:ro
+    - ./sql:/opt/airflow/sql:ro
+    - ./configs:/opt/airflow/configs:ro
+    # Writable: the landing zone the generator produces and ingestion reads.
+    - ./data:/opt/airflow/data
+    # Named volume: logs must survive a restart but must not pollute the repo.
+    - airflow-logs:/opt/airflow/logs
+  networks:
+    - volthive_net
+
+services:
+  # ===========================================================================
+  # PostgreSQL - three logical databases in one instance
+  #
+  #   warehouse : the platform (raw, stg, core, mart, dq, audit, ctl - Phase 3)
+  #   cms       : the simulated source OLTP system
+  #   airflow   : Airflow metadata, isolated from both of the above
+  #
+  # This is the only stateful service. Its volume is the thing worth protecting.
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: volthive-postgres
+    restart: unless-stopped
+    environment:
+      # Superuser. Used ONLY by the init scripts and for manual administration -
+      # no application component ever connects with it.
+      POSTGRES_USER: ${POSTGRES_USER:-volthive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Reject unauthenticated host connections explicitly rather than relying
+      # on the image default.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      # Consumed by the init scripts in docker/postgres/init/.
+      WH_DB: ${WH_DB:-warehouse}
+      CMS_DB: ${CMS_DB:-cms}
+      AIRFLOW_DB: ${AIRFLOW_DB:-airflow}
+      WH_ETL_USER: ${WH_ETL_USER:-wh_etl}
+      WH_ETL_PASSWORD: ${WH_ETL_PASSWORD:?set WH_ETL_PASSWORD in .env}
+      CMS_OWNER_USER: ${CMS_OWNER_USER:-cms_owner}
+      CMS_OWNER_PASSWORD: ${CMS_OWNER_PASSWORD:?set CMS_OWNER_PASSWORD in .env}
+      CMS_READER_USER: ${CMS_READER_USER:-cms_reader}
+      CMS_READER_PASSWORD: ${CMS_READER_PASSWORD:?set CMS_READER_PASSWORD in .env}
+      WH_ANALYST_USER: ${WH_ANALYST_USER:-wh_analyst}
+      WH_ANALYST_PASSWORD: ${WH_ANALYST_PASSWORD:?set WH_ANALYST_PASSWORD in .env}
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:-airflow}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
+    ports:
+      # Host port is separate from the in-network port on purpose: changing how
+      # you reach Postgres from Windows must not change how containers reach it.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Executed once, in filename order, on the first boot of an empty volume.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Deliberately stricter than `pg_isready`.
+      #
+      # During initdb the entrypoint runs the server with listen_addresses=''
+      # so it is reachable only over the local socket. Checking over TCP with
+      # -h 127.0.0.1 therefore fails until initialisation has fully completed
+      # and the real server has started - which is exactly the distinction we
+      # need between "container started" and "service ready".
+      #
+      # The second half asserts all three databases exist, so a partially
+      # applied bootstrap can never be reported as healthy.
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$${POSTGRES_PASSWORD}" psql -h 127.0.0.1 -U "$${POSTGRES_USER}" -d postgres -tAc
+          "SELECT count(*) = 3 FROM pg_database WHERE datname IN ('$${WH_DB}','$${CMS_DB}','$${AIRFLOW_DB}')"
+          | grep -q '^t$$'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # Generous: first boot has to run initdb plus both init scripts. Failures
+      # inside start_period do not count against `retries`.
+      start_period: 30s
+    networks:
+      - volthive_net
+
+  # ===========================================================================
+  # airflow-init - one-shot bootstrap, must exit 0 before anything else starts
+  #
+  # Migrates the metadata database, creates the admin user, ensures the pool.
+  # Exists as its own service so the scheduler and webserver cannot race each
+  # other running migrations, and so a migration failure is visible as a failed
+  # container rather than as two services crash-looping.
+  # ===========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: volthive-airflow-init
+    # A failed bootstrap must stay failed and visible, not restart in a loop.
+    restart: "no"
+    depends_on:
+      postgres:
+        # Not `service_started`: Postgres accepting a TCP connection is what we
+        # need, and only the healthcheck knows that. No sleep anywhere.
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.invalid}
+      AIRFLOW_ADMIN_FIRSTNAME: ${AIRFLOW_ADMIN_FIRSTNAME:-Local}
+      AIRFLOW_ADMIN_LASTNAME: ${AIRFLOW_ADMIN_LASTNAME:-Admin}
+    # Baked into the image and marked executable there, so a Windows checkout
+    # without the executable bit cannot break it.
+    entrypoint: /opt/airflow/init.sh
+
+  # ===========================================================================
+  # airflow-scheduler - parses DAGs, schedules and (under LocalExecutor) runs
+  # tasks in subprocesses of this container. There is no separate worker.
+  # ===========================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: volthive-airflow-scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        # Wait for the bootstrap to finish AND succeed. If migrations fail, the
+        # scheduler never starts, instead of starting against a stale schema.
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    command: scheduler
+    healthcheck:
+      # Asks Airflow itself whether a SchedulerJob on THIS host has a recent
+      # heartbeat. A process-liveness check would report a wedged scheduler as
+      # healthy; a heartbeat check does not.
+      test:
+        - CMD-SHELL
+        - airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    # Let in-flight tasks finish rather than killing them at 10 seconds.
+    stop_grace_period: 60s
+
+  # ===========================================================================
+  # airflow-webserver - the UI. Read-only in Phase 2: there are no DAGs yet.
+  # ===========================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: volthive-airflow-webserver
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEBSERVER_HOST_PORT:-8080}:8080"
+    healthcheck:
+      # Airflow's own /health endpoint reports the metadata database and
+      # scheduler heartbeat, so this checks the application, not just the port.
+      test:
+        - CMD-SHELL
+        - curl --fail --silent http://localhost:8080/health
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    stop_grace_period: 30s
+
+# ===========================================================================
+# Volumes
+#   pgdata       : the warehouse. Survives `make down`; destroyed by `make clean`.
+#   airflow-logs : task logs. A named volume rather than a bind mount so it
+#                  survives restarts without polluting the repository.
+# ===========================================================================
+volumes:
+  pgdata:
+    name: volthive_pgdata
+  airflow-logs:
+    name: volthive_airflow_logs
+
+# ===========================================================================
+# Network
+#   A single user-defined bridge. Services address each other by service name
+#   ("postgres"), which is why POSTGRES_HOST defaults to `postgres` rather than
+#   localhost. Only 5432 and 8080 are published to the host.
+# ===========================================================================
+networks:
+  volthive_net:
+    name: volthive_net
+    driver: bridge

@@ -1,0 +1,1 @@
+# Airflow DAG integrity tests - imports only, no database (Phase 11).

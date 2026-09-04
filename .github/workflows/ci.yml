@@ -1,0 +1,271 @@
+# ===========================================================================
+# CI - the same gates a reviewer would run, in the same order.
+#
+# ORDERING IS DELIBERATE: cheapest and most likely to fail first. A lint error
+# should cost thirty seconds, not the eight minutes it takes to stand up
+# PostgreSQL and run the end-to-end suite. Every job below is one the project
+# can also run locally through the Makefile with an identical command, so "it
+# passes on my machine" and "it passes in CI" mean the same thing.
+#
+# WHAT IS DELIBERATELY NOT HERE
+#   * No deployment. There is nothing to deploy - this is a warehouse you run.
+#   * No coverage gate. A percentage target rewards writing tests for trivial
+#     getters and says nothing about whether the SCD2 merge is correct. The
+#     integration and e2e suites are the coverage that matters and they are
+#     asserted directly.
+#   * No matrix over Python versions. The project pins 3.11 in pyproject.toml
+#     and ships a Docker image that runs 3.11. Testing versions the project
+#     does not support is theatre.
+# ===========================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a reviewer re-run the suite without an empty commit.
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Style and types. No database, no Docker, ~30 seconds.
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint, format and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # -c constraints.txt is not optional: installing Airflow without its
+          # official constraints file is the single most common way to end up
+          # with an environment that resolves but does not import.
+          pip install -r requirements-dev.txt -c constraints.txt
+          pip install -e . --no-deps
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy src
+
+      - name: sqlfluff
+        run: sqlfluff lint sql/
+
+  # -------------------------------------------------------------------------
+  # 2. Unit tests, including the repository-wide secret scan. Still no
+  #    database - these run in seconds and catch most regressions.
+  # -------------------------------------------------------------------------
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -c constraints.txt
+          pip install -e . --no-deps
+      - name: pytest -m unit
+        run: pytest -m unit -q
+
+  # -------------------------------------------------------------------------
+  # 3. DAG integrity. Imports every DAG and asserts the scheduling policy.
+  #    Needs Airflow installed but no database and no scheduler, so it stays
+  #    fast while still catching the class of error that only appears when the
+  #    scheduler parses a file.
+  # -------------------------------------------------------------------------
+  dags:
+    name: DAG integrity
+    runs-on: ubuntu-latest
+    env:
+      AIRFLOW_HOME: ${{ github.workspace }}/.airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -c constraints.txt
+          pip install -e . --no-deps
+      - name: pytest -m dags
+        run: pytest -m dags -q
+
+  # -------------------------------------------------------------------------
+  # 4. Integration and end-to-end against a REAL PostgreSQL.
+  #
+  #    The database is a service container, not a mock. Every claim this
+  #    project makes - SCD2 chains without overlaps, exclusion constraints,
+  #    partition pruning, checksum-identical reruns - is a claim about
+  #    PostgreSQL behaviour, and a mock would assert only that the mock works.
+  # -------------------------------------------------------------------------
+  integration:
+    name: Integration and end-to-end
+    runs-on: ubuntu-latest
+    needs: [lint, unit]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_only_not_a_real_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # Without a healthcheck the first connection races the server's
+        # startup and the job fails intermittently - which teaches everyone to
+        # click "re-run" instead of reading the error.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci_only_not_a_real_password
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      WH_DB: warehouse
+      CMS_DB: cms
+      WH_ETL_USER: wh_etl
+      WH_ETL_PASSWORD: ci_only_not_a_real_password
+      CMS_OWNER_USER: cms_owner
+      CMS_OWNER_PASSWORD: ci_only_not_a_real_password
+      CMS_READER_USER: cms_reader
+      CMS_READER_PASSWORD: ci_only_not_a_real_password
+      WH_ANALYST_USER: wh_analyst
+      WH_ANALYST_PASSWORD: ci_only_not_a_real_password
+      VOLTHIVE_GENERATOR_PROFILE: tiny
+      VOLTHIVE_TEST_DB: postgresql://wh_etl:ci_only_not_a_real_password@127.0.0.1:5432/warehouse
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -c constraints.txt
+          pip install -e . --no-deps
+
+      # The compose stack's init scripts do this on first boot. CI has no
+      # compose stack, so the same bootstrap runs here against the service
+      # container - deliberately the SAME scripts, so a change to the
+      # privilege model cannot pass CI while breaking the real stack.
+      - name: Bootstrap roles, databases and extensions
+        run: |
+          set -euo pipefail
+          export AIRFLOW_DB=airflow
+          export AIRFLOW_DB_USER=airflow
+          export AIRFLOW_DB_PASSWORD=ci_only_not_a_real_password
+          export POSTGRES_USER=postgres
+          bash docker/postgres/init/01_create_roles.sh
+          bash docker/postgres/init/02_create_databases.sh
+          bash docker/postgres/init/03_create_extensions.sh
+
+      - name: Apply the warehouse schema
+        run: python scripts/apply_schema.py
+
+      - name: Generate the tiny dataset
+        run: python scripts/generate_data.py --profile tiny
+
+      - name: pytest -m "integration or e2e"
+        run: pytest -m "integration or e2e" -q
+
+      # Not covered by the suite: proof that the ten showcase queries run
+      # against a warehouse built by CI rather than by a developer's laptop.
+      - name: Run the analytics queries
+        run: |
+          set -euo pipefail
+          for f in sql/analytics/*.sql; do
+            echo "-- $f"
+            psql -v ON_ERROR_STOP=1 -d warehouse -qtA -f "$f" > /dev/null
+          done
+
+  # -------------------------------------------------------------------------
+  # 5. The stack itself. Validates that compose renders and the image builds,
+  #    without starting the whole thing - a full `up` in CI costs minutes and
+  #    proves little more than this does.
+  # -------------------------------------------------------------------------
+  docker:
+    name: Docker and compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provide the environment compose expects
+        run: cp .env.example .env
+
+      - name: docker compose config
+        run: docker compose config --quiet
+
+      - name: Build the Airflow image
+        run: docker compose build airflow-scheduler
+
+      - name: Shell scripts parse
+        run: |
+          set -euo pipefail
+          for f in $(find scripts docker -name '*.sh'); do bash -n "$f"; done
+
+  # -------------------------------------------------------------------------
+  # 6. Secret scanning, twice over.
+  #
+  #    The unit suite already runs the project's own scanner against the
+  #    working tree. gitleaks additionally walks the COMMIT HISTORY, which is
+  #    the case the in-tree test cannot see: a credential removed in a later
+  #    commit is still in the history and still has to be rotated.
+  # -------------------------------------------------------------------------
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs history, not just the tip commit.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

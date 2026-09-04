@@ -1,0 +1,52 @@
+# Row-level rules for meter telemetry, enforced in sql/stg/20_meter_sample.sql
+# and sql/stg/21_meter_interval.sql.
+rules:
+  - rule_code: MTR_NULL_TRANSACTION_ID
+    entity: stg.meter_sample
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: A sample with no transaction_id cannot be attached to any session.
+
+  - rule_code: MTR_SOC_OUT_OF_RANGE
+    entity: stg.meter_sample
+    layer: stg
+    rule_type: range
+    scope: row
+    severity: error
+    params: {min: 0, max: 100}
+    description: >-
+      State of charge outside 0-100%. A meter fault; a charging-curve analysis
+      built on 104% is nonsense.
+
+  - rule_code: MTR_NEGATIVE_INTERVAL_ENERGY
+    entity: stg.meter_interval
+    layer: stg
+    rule_type: range
+    scope: row
+    severity: error
+    description: >-
+      The cumulative register went backwards between two samples - a mid-session
+      meter reset. Quarantined rather than clamped: clamping would under-report
+      the session's energy invisibly.
+
+  - rule_code: MTR_ZERO_INTERVAL
+    entity: stg.meter_interval
+    layer: stg
+    rule_type: rule
+    scope: row
+    severity: error
+    description: Two samples share a timestamp, so the interval has no duration.
+
+  - rule_code: MTR_ORPHAN_EXPIRED
+    entity: stg.meter_sample
+    layer: stg
+    rule_type: referential
+    scope: row
+    severity: error
+    description: >-
+      A sample whose session never arrived, even after the lookback window
+      expired. Orphans are HELD while the window is open - the session record
+      usually lands a day later - and only become failures once no future file
+      can still bring it.

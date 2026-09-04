@@ -1,0 +1,42 @@
+# Row-level rules for the roaming partner source.
+rules:
+  - rule_code: PTR_NULL_CDR_ID
+    entity: stg.partner_session
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: No cdr_id - the record cannot be deduplicated against revisions.
+
+  - rule_code: PTR_NULL_TRANSACTION_ID
+    entity: stg.partner_session
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: >-
+      No transaction_id, so the record cannot be matched against the OCPP feed
+      and the cross-source duplicate check cannot be applied to it.
+
+  - rule_code: PTR_NULL_CURSOR
+    entity: stg.partner_session
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: >-
+      last_updated missing or unparseable. This source's watermark IS
+      last_updated, so a record without one cannot be positioned in the cursor
+      and would be re-read for ever.
+
+  - rule_code: PTR_UNEXPECTED_CURRENCY
+    entity: stg.partner_session
+    layer: stg
+    rule_type: accepted_values
+    scope: row
+    severity: error
+    params: {accepted: [INR]}
+    description: >-
+      A currency other than INR. No conversion rate is configured, and silently
+      adding a foreign-currency amount to a rupee total would corrupt revenue
+      in a way no aggregate would reveal.

@@ -1,0 +1,22 @@
+state,effective_from_date,effective_to_date,slab_name,commercial_rate_inr_per_kwh,source_note
+Karnataka,2024-04-01,2025-03-31,HT-2A Commercial,7.65,Illustrative rate for this project. Not an audited real tariff.
+Karnataka,2025-04-01,2026-03-31,HT-2A Commercial,8.10,Illustrative rate for this project. Not an audited real tariff.
+Karnataka,2026-04-01,2027-03-31,HT-2A Commercial,8.55,Illustrative rate for this project. Not an audited real tariff.
+Delhi,2024-04-01,2025-03-31,EV Charging Tariff,4.90,Illustrative rate for this project. Not an audited real tariff.
+Delhi,2025-04-01,2026-03-31,EV Charging Tariff,5.20,Illustrative rate for this project. Not an audited real tariff.
+Delhi,2026-04-01,2027-03-31,EV Charging Tariff,5.50,Illustrative rate for this project. Not an audited real tariff.
+Maharashtra,2024-04-01,2025-03-31,EV-HT Commercial,7.20,Illustrative rate for this project. Not an audited real tariff.
+Maharashtra,2025-04-01,2026-03-31,EV-HT Commercial,7.55,Illustrative rate for this project. Not an audited real tariff.
+Maharashtra,2026-04-01,2027-03-31,EV-HT Commercial,7.95,Illustrative rate for this project. Not an audited real tariff.
+Telangana,2024-04-01,2025-03-31,EV Charging LT-VIII,6.70,Illustrative rate for this project. Not an audited real tariff.
+Telangana,2025-04-01,2026-03-31,EV Charging LT-VIII,6.95,Illustrative rate for this project. Not an audited real tariff.
+Telangana,2026-04-01,2027-03-31,EV Charging LT-VIII,7.30,Illustrative rate for this project. Not an audited real tariff.
+Tamil Nadu,2024-04-01,2025-03-31,HT-Commercial EV,7.40,Illustrative rate for this project. Not an audited real tariff.
+Tamil Nadu,2025-04-01,2026-03-31,HT-Commercial EV,7.75,Illustrative rate for this project. Not an audited real tariff.
+Tamil Nadu,2026-04-01,2027-03-31,HT-Commercial EV,8.15,Illustrative rate for this project. Not an audited real tariff.
+Gujarat,2024-04-01,2025-03-31,EV Charging Station,6.20,Illustrative rate for this project. Not an audited real tariff.
+Gujarat,2025-04-01,2026-03-31,EV Charging Station,6.55,Illustrative rate for this project. Not an audited real tariff.
+Gujarat,2026-04-01,2027-03-31,EV Charging Station,6.90,Illustrative rate for this project. Not an audited real tariff.
+West Bengal,2024-04-01,2025-03-31,Commercial EV,7.85,Illustrative rate for this project. Not an audited real tariff.
+West Bengal,2025-04-01,2026-03-31,Commercial EV,8.20,Illustrative rate for this project. Not an audited real tariff.
+West Bengal,2026-04-01,2027-03-31,Commercial EV,8.60,Illustrative rate for this project. Not an audited real tariff.

@@ -53,13 +53,54 @@ select = [
 ]
 ignore = [
     "E501",  # line length is enforced by the formatter, not the linter
+    # SIM117 wants `with connect() as conn, transaction(conn):` collapsed onto
+    # one line. It is legal Python and it is worse here. A connection and a
+    # transaction are two different lifetimes - the connection outlives the
+    # transaction, and a later change that adds a second transaction on the
+    # same connection has to un-collapse it again. This project treats
+    # transaction boundaries as load-bearing and indents them so they are
+    # visible at a glance; hiding one behind a comma works against that.
+    "SIM117",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests may assert, hardcode obviously-fake credentials, and print.
-"tests/**/*.py" = ["S101", "S105", "S106", "T20", "ARG001", "ARG002"]
+# Beyond the obvious (assert, fake credentials, print):
+#   S608   the SQL built in tests comes from module-level constant table lists
+#          used to assert the same property across every table, never input.
+#   RUF007 itertools.pairwise is neater, but zip(xs, xs[1:]) reads more
+#          plainly in an assertion about SUCCESSIVE READINGS, which is what
+#          these tests are about.
+#   N818   _Rollback is a control-flow SENTINEL used to abort a mutating
+#          assertion block and roll it back. It is not an error, and calling
+#          it _RollbackError would say the opposite of what it means.
+#   N802   one test name shouts a word (test_check_results_DO_accumulate) to
+#          mark it as the deliberate exception to the surrounding class of
+#          "nothing changes" assertions. The emphasis is the point.
+"tests/**/*.py" = [
+    "S101", "S105", "S106", "T20", "ARG001", "ARG002",
+    "S608", "RUF007", "N818", "N802",
+]
 # Airflow DAG files legitimately execute code at import time.
 "dags/**/*.py" = ["E402"]
+# Operator-facing CLIs. Every one of these is deliberate, and each is listed
+# with the reason rather than switched off globally:
+#
+#   T201  print IS the interface of a command-line tool. structlog goes to
+#         stdout as JSON for machines; these lines are for the human running
+#         the script, and routing them through a logger would make --json
+#         output unparseable.
+#   E402  sys.path is extended to reach src/ before the imports, so that a
+#         fresh clone runs without an editable install.
+#   S608  the SQL these scripts build is assembled from module-level constant
+#         table names (RAW_HISTORY_TABLES and friends), never from user input.
+#         The rule cannot see that; a reviewer can.
+"scripts/**/*.py" = ["T201", "E402", "S608"]
+# The data generator's whole purpose is pseudo-random synthetic data, seeded
+# for reproducibility. S311 warns that `random` is not cryptographic, which is
+# exactly what is wanted here: a CSPRNG could not be seeded to reproduce a
+# dataset, and reproducibility is the property the entire test suite rests on.
+"src/volthive/generator/**/*.py" = ["S311"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["volthive"]
@@ -76,6 +117,10 @@ line-ending = "lf"   # containers are Linux; never emit CRLF from the formatter
 minversion = "8.0"
 testpaths = ["tests"]
 addopts = "--strict-markers --strict-config -ra"
+# Import the package from src/ without requiring an editable install, so a
+# fresh clone can run `pytest` immediately and CI cannot pass or fail because
+# of install state rather than code.
+pythonpath = ["src"]
 markers = [
     "unit: fast, no external dependencies, everything I/O is mocked",
     "dags: Airflow DAG integrity checks - imports only, no database",

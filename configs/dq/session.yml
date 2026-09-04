@@ -1,0 +1,108 @@
+# Row-level rules for the charging session, enforced in sql/stg/10_session.sql.
+#
+# Every one of these maps to a REAL, DOCUMENTED failure mode of OCPP telemetry.
+# None is invented to give the quality layer something to catch, which is what
+# makes the quarantine story credible rather than decorative.
+rules:
+  - rule_code: CDR_NULL_TRANSACTION_ID
+    entity: stg.session
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: >-
+      A charge detail record with no transaction_id. The grain key is missing,
+      so the record cannot become a fact row and cannot even be deduplicated.
+
+  - rule_code: CDR_NULL_CHARGE_POINT
+    entity: stg.session
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: >-
+      No charge_point_id. Unlike an UNRECOGNISED device - which becomes an
+      inferred dimension member - a missing one gives nothing to infer from.
+
+  - rule_code: CDR_MISSING_STOP
+    entity: stg.session
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: >-
+      No stop_timestamp; the charger lost connectivity mid-session. REQUEUEABLE
+      - a later file usually carries the completed record, and the requeue
+      script exists for exactly this rule.
+
+  - rule_code: CDR_TIME_INVERSION
+    entity: stg.session
+    layer: stg
+    rule_type: rule
+    scope: row
+    severity: error
+    description: Stop precedes start. Device clock drift, not a real session.
+
+  - rule_code: CDR_NEGATIVE_ENERGY
+    entity: stg.session
+    layer: stg
+    rule_type: range
+    scope: row
+    severity: error
+    description: >-
+      Stop register below start register - the meter was reset mid-session. The
+      delta is meaningless, and clamping it to zero would silently under-report
+      energy for that session.
+
+  - rule_code: CDR_ENERGY_OUT_OF_RANGE
+    entity: stg.session
+    layer: stg
+    rule_type: range
+    scope: row
+    severity: error
+    params: {min: 0, max: 350}
+    description: >-
+      Energy outside 0-350 kWh. Above 350 kWh exceeds any plausible single
+      session on the largest commercial pack in the fleet.
+
+  - rule_code: CDR_IMPLAUSIBLE_DURATION
+    entity: stg.session
+    layer: stg
+    rule_type: range
+    scope: row
+    severity: error
+    params: {min_seconds: 30, max_seconds: 86400}
+    description: >-
+      Duration outside 30 seconds to 24 hours. Below 30s is a failed handshake
+      rather than a charge; above 24h is a session the charger never closed.
+
+  - rule_code: CDR_BAD_TIMESTAMP_FORMAT
+    entity: stg.session
+    layer: stg
+    rule_type: cast
+    scope: row
+    severity: error
+    description: >-
+      A timestamp that will not parse as an ISO 8601 instant with an explicit
+      zone. Zone-less values are rejected rather than assumed.
+
+  - rule_code: CDR_BAD_NUMERIC
+    entity: stg.session
+    layer: stg
+    rule_type: cast
+    scope: row
+    severity: error
+    description: >-
+      A meter register that will not parse as a number - typically a value that
+      arrived with its unit appended.
+
+  - rule_code: CDR_UNKNOWN_STOP_REASON
+    entity: stg.session
+    layer: stg
+    rule_type: accepted_values
+    scope: row
+    severity: warn
+    description: >-
+      Stop reason outside the known set. WARN, not error: the reason is mapped
+      to OTHER and the session is KEPT. Losing a real charging session because
+      a charger reported an unfamiliar reason code would be absurd.

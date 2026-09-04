@@ -1,0 +1,426 @@
+# Dataset-level rules over the fact tables, plus the reconciliation identities.
+#
+# THE RECONCILIATION RULES ARE THE ONES THAT MATTER MOST. "raw = staged +
+# quarantined + deduplicated" is an accounting identity over the pipeline: if
+# it holds, no row was lost anywhere between the landing zone and the
+# warehouse, and that can be SAID WITH PROOF rather than hoped.
+rules:
+  - rule_code: FACT_SESSION_GRAIN_UNIQUE
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: unique
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH dupes AS (
+          SELECT f.transaction_id
+          FROM core.fact_charging_session AS f
+          GROUP BY f.transaction_id
+          HAVING count(*) > 1
+      )
+      SELECT
+          (SELECT count(*) FROM core.fact_charging_session) AS rows_evaluated,
+          (SELECT count(*) FROM dupes)                      AS rows_failed
+    description: >-
+      Zero duplicate transaction_ids. Also enforced by a unique constraint, so
+      a failure here would mean the constraint was dropped - which is exactly
+      the kind of thing a check should notice.
+
+  - rule_code: FACT_METER_GRAIN_UNIQUE
+    entity: core.fact_meter_interval
+    layer: core
+    rule_type: unique
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH dupes AS (
+          SELECT f.transaction_id, f.interval_seq
+          FROM core.fact_meter_interval AS f
+          GROUP BY f.transaction_id, f.interval_seq
+          HAVING count(*) > 1
+      )
+      SELECT
+          (SELECT count(*) FROM core.fact_meter_interval) AS rows_evaluated,
+          (SELECT count(*) FROM dupes)                    AS rows_failed
+    description: >-
+      Zero duplicate (transaction_id, interval_seq). Note this checks the
+      grain ACROSS partitions - the unique constraint can only enforce it
+      within one, because the partition key must be part of it.
+
+  - rule_code: FACT_STATION_DAY_GRAIN_UNIQUE
+    entity: core.fact_station_daily_utilization
+    layer: core
+    rule_type: unique
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH dupes AS (
+          SELECT f.date_key, f.station_sk
+          FROM core.fact_station_daily_utilization AS f
+          GROUP BY f.date_key, f.station_sk
+          HAVING count(*) > 1
+      )
+      SELECT
+          (SELECT count(*) FROM core.fact_station_daily_utilization) AS rows_evaluated,
+          (SELECT count(*) FROM dupes)                               AS rows_failed
+    description: Zero duplicate (date_key, station_sk) in the snapshot fact.
+
+  - rule_code: FACT_SESSION_FK_ORPHANS
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: referential
+    scope: dataset
+    severity: error
+    rule_sql: |
+      SELECT
+          count(*) AS rows_evaluated,
+          count(*) FILTER (
+              WHERE cu.customer_sk IS NULL
+                 OR st.station_sk IS NULL
+                 OR cp.charge_point_sk IS NULL
+                 OR tp.tariff_plan_sk IS NULL
+                 OR v.vehicle_sk IS NULL
+          ) AS rows_failed
+      FROM core.fact_charging_session AS f
+      LEFT JOIN core.dim_customer AS cu ON cu.customer_sk = f.customer_sk
+      LEFT JOIN core.dim_station AS st ON st.station_sk = f.station_sk
+      LEFT JOIN core.dim_charge_point AS cp ON cp.charge_point_sk = f.charge_point_sk
+      LEFT JOIN core.dim_tariff_plan AS tp ON tp.tariff_plan_sk = f.tariff_plan_sk
+      LEFT JOIN core.dim_vehicle AS v ON v.vehicle_sk = f.vehicle_sk
+      WHERE f.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+    description: >-
+      Every fact foreign key resolves to a dimension row. Declared constraints
+      already guarantee this; the rule exists so a future load that disables
+      them for speed cannot do so silently.
+
+  - rule_code: FACT_METER_ORPHAN_SESSION
+    entity: core.fact_meter_interval
+    layer: core
+    rule_type: referential
+    scope: dataset
+    severity: error
+    rule_sql: |
+      SELECT
+          count(*) AS rows_evaluated,
+          count(*) FILTER (WHERE s.charging_session_sk IS NULL) AS rows_failed
+      FROM core.fact_meter_interval AS m
+      LEFT JOIN core.fact_charging_session AS s
+          ON s.charging_session_sk = m.charging_session_sk
+      WHERE m.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+    description: >-
+      Every interval points at a real session. This relationship is
+      DELIBERATELY NOT a declared foreign key - see the note in
+      sql/ddl/31_core_facts.sql - so this rule is the only thing enforcing it,
+      and it is error severity for that reason.
+
+  - rule_code: FACT_UNKNOWN_MEMBER_RATIO
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: ratio
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      SELECT
+          count(*) AS rows_evaluated,
+          count(*) FILTER (
+              WHERE f.charge_point_sk = -1 OR f.tariff_plan_sk = -1 OR f.customer_sk = -1
+          ) AS rows_failed,
+          round(
+              100.0 * count(*) FILTER (
+                  WHERE f.charge_point_sk = -1 OR f.tariff_plan_sk = -1 OR f.customer_sk = -1
+              ) / nullif(count(*), 0), 4
+          ) AS observed_value
+      FROM core.fact_charging_session AS f
+      WHERE f.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+    params: {max_value: 5.0}
+    description: >-
+      Share of sessions resolving to an UNKNOWN dimension member. Some is
+      normal - a device commissioned this morning, a dangling tariff reference
+      from a bad admin edit. A rising share means master data is drifting away
+      from what the chargers are actually reporting.
+
+  - rule_code: SESSION_CROSS_SOURCE_DUP
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: unique
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH cross_source AS (
+          SELECT f.transaction_id
+          FROM core.fact_charging_session AS f
+          GROUP BY f.transaction_id
+          HAVING count(DISTINCT f.source_system) > 1
+      )
+      SELECT
+          (SELECT count(*) FROM core.fact_charging_session) AS rows_evaluated,
+          (SELECT count(*) FROM cross_source)                       AS rows_failed
+    description: >-
+      No transaction_id enters the fact from both OCPP and the partner API. An
+      INBOUND roaming session is reported by both systems; OCPP is
+      authoritative and the partner copy must never become a second row.
+
+  - rule_code: REVENUE_NON_NEGATIVE
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: range
+    scope: dataset
+    severity: error
+    rule_sql: |
+      SELECT
+          count(*) AS rows_evaluated,
+          count(*) FILTER (WHERE f.gross_revenue_inr < 0) AS rows_failed
+      FROM core.fact_charging_session AS f
+      WHERE f.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+    description: No session produces negative revenue.
+
+  - rule_code: MARGIN_PLAUSIBILITY
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: range
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      SELECT
+          count(*) AS rows_evaluated,
+          count(*) FILTER (
+              WHERE f.gross_revenue_inr > 0
+                AND (f.gross_margin_inr / f.gross_revenue_inr) NOT BETWEEN -0.5 AND 0.95
+          ) AS rows_failed
+      FROM core.fact_charging_session AS f
+      WHERE f.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+        -- Roaming sessions are EXCLUDED, and not to make the number look
+        -- better. An OUTBOUND roaming session was billed by the partner on the
+        -- partner's price list, and VoltHive never bought the energy from a
+        -- grid it operates - so grid_energy_cost_inr is legitimately zero and
+        -- the margin ratio is legitimately 1.0. Including them would make this
+        -- rule fire on correct data every single day, and a rule that always
+        -- fires is a rule everybody learns to ignore.
+        AND NOT f.is_roaming
+    params: {max_fail_ratio: 0.02}
+    description: >-
+      Margin ratio within [-0.5, 0.95]. WARN: a loss-making session is real
+      (a fleet contract below grid cost), but a whole window of them is a
+      pricing or grid-tariff mapping error.
+
+  - rule_code: RECON_RAW_TO_STG_SESSION
+    entity: stg.session
+    layer: stg
+    rule_type: reconciliation
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH raw_side AS (
+          SELECT count(DISTINCT r.payload ->> 'transaction_id') AS distinct_txn
+          FROM raw.ocpp_cdr AS r
+          WHERE r.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+            AND r.payload ->> 'transaction_id' IS NOT NULL
+      ),
+      stg_side AS (
+          SELECT count(*) AS staged
+          FROM stg.session AS s
+          WHERE s.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+            AND s.source_system = 'OCPP'
+      ),
+      q_side AS (
+          SELECT count(DISTINCT q.natural_key) AS quarantined
+          FROM dq.quarantine_ocpp_cdr AS q
+          WHERE q.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+            AND q.natural_key IS NOT NULL
+      )
+      SELECT
+          (SELECT distinct_txn FROM raw_side) AS rows_evaluated,
+          abs(
+              (SELECT distinct_txn FROM raw_side)
+              - (SELECT staged FROM stg_side)
+              - (SELECT quarantined FROM q_side)
+          ) AS rows_failed,
+          (SELECT distinct_txn FROM raw_side) AS observed_value
+    description: >-
+      THE ACCOUNTING IDENTITY: every distinct transaction_id that landed in raw
+      is either staged or quarantined. Not one is lost. Duplicates collapse
+      before this count because it is over DISTINCT keys, which is the right
+      granularity - a retry storm does not change how many sessions occurred.
+
+  - rule_code: RECON_STG_TO_FACT_SESSION
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: reconciliation
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH stg_side AS (
+          SELECT
+              count(*)                        AS n,
+              COALESCE(sum(s.energy_delivered_kwh), 0) AS energy
+          FROM stg.session AS s
+          WHERE s.business_date_ist BETWEEN :batch_lo AND :batch_hi
+      ),
+      fact_side AS (
+          SELECT
+              count(*)                        AS n,
+              COALESCE(sum(f.energy_delivered_kwh), 0) AS energy
+          FROM core.fact_charging_session AS f
+          WHERE f.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+      )
+      SELECT
+          (SELECT n FROM stg_side) AS rows_evaluated,
+          CASE
+              WHEN (SELECT n FROM stg_side) <> (SELECT n FROM fact_side) THEN 1
+              WHEN abs((SELECT energy FROM stg_side) - (SELECT energy FROM fact_side)) > 0.001
+                  THEN 1
+              ELSE 0
+          END AS rows_failed,
+          abs((SELECT energy FROM stg_side) - (SELECT energy FROM fact_side)) AS observed_value
+    description: >-
+      Row counts AND summed energy match between staging and the fact table,
+      within 0.001 kWh. Counting rows alone would miss a transformation that
+      loses a measure while preserving the row.
+
+  - rule_code: QUARANTINE_RATIO_SESSION
+    entity: stg.session
+    layer: stg
+    rule_type: ratio
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH totals AS (
+          SELECT
+              (
+                  SELECT count(*) FROM stg.session AS s
+                  WHERE s.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+              ) AS good,
+              (
+                  SELECT count(*) FROM dq.quarantine_ocpp_cdr AS q
+                  WHERE q.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+              ) AS bad
+      )
+      SELECT
+          t.good + t.bad AS rows_evaluated,
+          t.bad          AS rows_failed,
+          round(100.0 * t.bad / nullif(t.good + t.bad, 0), 4) AS observed_value
+      FROM totals AS t
+    params: {max_value: 20.0}
+    description: >-
+      Quarantine share below 20%. THE ESCALATION RULE: one bad record is a bad
+      record and must not fail a pipeline, but a fifth of the feed being
+      rejected is no longer a bad record - it is a bad FEED, and the mart
+      should not publish it.
+
+  - rule_code: ROWCOUNT_ZERO_SESSION
+    entity: raw.ocpp_cdr
+    layer: raw
+    rule_type: row_count_anomaly
+    scope: dataset
+    severity: error
+    rule_sql: |
+      SELECT
+          1 AS rows_evaluated,
+          CASE WHEN count(*) = 0 THEN 1 ELSE 0 END AS rows_failed,
+          count(*) AS observed_value
+      FROM raw.ocpp_cdr AS r
+      WHERE r.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+    description: >-
+      Zero charge detail records for the window. Distinct from the anomaly rule
+      below and ERROR rather than warn, because a quiet day is plausible and
+      complete silence is an outage.
+
+  - rule_code: ROWCOUNT_ANOMALY_SESSION
+    entity: raw.ocpp_cdr
+    layer: raw
+    rule_type: row_count_anomaly
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      WITH today AS (
+          SELECT COALESCE(sum(l.rows_inserted), 0)::NUMERIC AS n
+          FROM audit.load_stat AS l
+          WHERE l.target_table = 'raw.ocpp_cdr'
+            AND l.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+      ),
+      baseline AS (
+          SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY d.n)::NUMERIC AS median_n
+          FROM (
+              SELECT l.dw_batch_key, sum(l.rows_inserted) AS n
+              FROM audit.load_stat AS l
+              WHERE l.target_table = 'raw.ocpp_cdr'
+                AND l.dw_batch_key < :batch_lo
+                AND l.dw_batch_key >= (:batch_lo::DATE - INTERVAL '28 days')
+                AND extract(ISODOW FROM l.dw_batch_key)
+                    = extract(ISODOW FROM :batch_lo::DATE)
+              GROUP BY l.dw_batch_key
+          ) AS d
+      )
+      SELECT
+          1 AS rows_evaluated,
+          CASE
+              WHEN (SELECT median_n FROM baseline) IS NULL THEN 0
+              WHEN (SELECT median_n FROM baseline) = 0 THEN 0
+              WHEN abs((SELECT n FROM today) - (SELECT median_n FROM baseline))
+                   / (SELECT median_n FROM baseline) > 0.40 THEN 1
+              ELSE 0
+          END AS rows_failed,
+          (SELECT n FROM today) AS observed_value
+    description: >-
+      Volume within 40% of the trailing median for the SAME WEEKDAY. Weekday
+      aware because charging volume is visibly weekly-seasonal - a Sunday
+      compared against a Wednesday baseline would alert every week. MEDIAN, not
+      mean, so one outlier day cannot poison the baseline. WARN, because a
+      genuine public holiday should not stop the warehouse. Passes silently
+      until enough history exists to have a baseline at all.
+
+  - rule_code: FRESHNESS_SESSION
+    entity: core.fact_charging_session
+    layer: core
+    rule_type: freshness
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      SELECT
+          1 AS rows_evaluated,
+          CASE
+              WHEN max(f.session_start_utc) IS NULL THEN 1
+              WHEN max(f.session_start_utc) < (:batch_hi::DATE - INTERVAL '2 days') THEN 1
+              ELSE 0
+          END AS rows_failed,
+          extract(
+              EPOCH FROM (:batch_hi::DATE - max(f.session_start_utc))
+          ) / 3600.0 AS observed_value
+      FROM core.fact_charging_session AS f
+    description: >-
+      The newest session is recent relative to the window being processed.
+      Measured on EVENT time, not load time: load-time freshness passes happily
+      while cheerfully ingesting a week-old file.
+
+  - rule_code: SCHEMA_DRIFT_OCPP
+    entity: raw.ocpp_cdr
+    layer: raw
+    rule_type: schema
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      WITH observed AS (
+          SELECT DISTINCT jsonb_object_keys(r.payload) AS key
+          FROM raw.ocpp_cdr AS r
+          WHERE r.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+      ),
+      expected AS (
+          SELECT unnest(ARRAY[
+              'transaction_id', 'charge_point_id', 'connector_no', 'id_tag',
+              'customer_id', 'vehicle_id', 'start_timestamp', 'stop_timestamp',
+              'meter_start_wh', 'meter_stop_wh', 'stop_reason', 'session_status',
+              'auth_method', 'energy_unit', 'firmware_version', 'record_version',
+              'emitted_at'
+          ]) AS key
+      )
+      SELECT
+          (SELECT count(*) FROM observed)                              AS rows_evaluated,
+          (SELECT count(*) FROM observed WHERE key NOT IN (SELECT key FROM expected))
+          AS rows_failed
+    description: >-
+      A key appeared in the payload that the contract does not declare. WARN,
+      not error, and that asymmetry is the point: raw JSONB has already
+      captured the new field losslessly, so history is available from the day
+      it first appeared and adopting it later is a deliberate staging change.
+      A MISSING expected key is the error case, because downstream casts would
+      then silently produce NULLs.

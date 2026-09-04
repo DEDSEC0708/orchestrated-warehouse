@@ -1,0 +1,64 @@
+# Row-level rules for CMS master data, enforced in sql/stg/00-04.
+rules:
+  - rule_code: CMS_NULL_NATURAL_KEY
+    entity: stg.cms
+    layer: stg
+    rule_type: not_null
+    scope: row
+    severity: error
+    description: A master-data row with no primary key. Nothing can reference it.
+
+  - rule_code: CMS_INVALID_SEGMENT
+    entity: stg.customer
+    layer: stg
+    rule_type: accepted_values
+    scope: row
+    severity: error
+    params: {accepted: [RETAIL, FLEET, CORPORATE]}
+    description: >-
+      Customer segment outside the accepted set AFTER case and whitespace
+      normalisation. "Fleet" and " FLEET " are conformed, not rejected -
+      only a genuinely unknown value fails.
+
+  - rule_code: CMS_INVALID_PRICE
+    entity: stg.tariff_plan
+    layer: stg
+    rule_type: range
+    scope: row
+    severity: error
+    description: >-
+      price_per_kwh_inr missing, unparseable or negative. Quarantined rather
+      than defaulted to zero: a session priced at zero looks like a free
+      charge, which is a plausible-looking number and therefore far more
+      dangerous than a missing one.
+
+  - rule_code: CMS_UPDATED_BEFORE_CREATED
+    entity: stg.cms
+    layer: stg
+    rule_type: rule
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      SELECT
+          count(*)                                                    AS rows_evaluated,
+          count(*) FILTER (
+              WHERE c.source_updated_at_utc < c.source_created_at_utc
+          )                                                           AS rows_failed
+      FROM stg.customer AS c
+      WHERE c.dw_batch_key BETWEEN :batch_lo AND :batch_hi
+    params: {max_fail_ratio: 0.05}
+    description: >-
+      updated_at precedes created_at in the source. A sloppy source clock, not
+      a broken row: WARN and keep. Treating it as fatal would reject usable
+      data over a cosmetic inconsistency.
+
+  - rule_code: SCD_RETRO_DATED_CHANGE
+    entity: core.dim
+    layer: core
+    rule_type: rule
+    scope: row
+    severity: warn
+    description: >-
+      A dimension change arrived dated EARLIER than the current version's
+      effective_from. Applying it naively would invert the validity interval,
+      so the merge refuses it and routes it here for manual repair from raw.

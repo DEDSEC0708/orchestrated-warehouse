@@ -1,0 +1,132 @@
+# Dataset-level rules over the dimensional model.
+#
+# The three SCD2 invariants below are the ones worth stating out loud. The
+# schema already makes "two current rows" and "overlapping history" impossible
+# through a partial unique index and an exclusion constraint - but NOTHING in
+# the schema can prevent ZERO current rows, because that is the absence of a
+# row rather than the presence of a bad one. Only the single-transaction merge
+# prevents it, and DIM_NO_CURRENT_ROW is what verifies the merge held.
+rules:
+  - rule_code: DIM_SINGLE_CURRENT_ROW
+    entity: core.dim
+    layer: core
+    rule_type: unique
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH counts AS (
+          SELECT customer_id AS bk, count(*) AS current_rows
+          FROM core.dim_customer WHERE is_current GROUP BY customer_id
+          UNION ALL
+          SELECT station_id, count(*) FROM core.dim_station
+          WHERE is_current GROUP BY station_id
+          UNION ALL
+          SELECT charge_point_id, count(*) FROM core.dim_charge_point
+          WHERE is_current GROUP BY charge_point_id
+          UNION ALL
+          SELECT tariff_plan_id, count(*) FROM core.dim_tariff_plan
+          WHERE is_current GROUP BY tariff_plan_id
+      )
+      SELECT
+          count(*)                                        AS rows_evaluated,
+          count(*) FILTER (WHERE c.current_rows <> 1)     AS rows_failed
+      FROM counts AS c
+    description: >-
+      Exactly one current row per business key in every SCD2 dimension. Also
+      enforced structurally by a partial unique index, so a failure here means
+      something bypassed the merge entirely.
+
+  - rule_code: DIM_NO_CURRENT_ROW
+    entity: core.dim
+    layer: core
+    rule_type: rule
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH keys AS (
+          SELECT DISTINCT
+              customer_id AS bk,
+              bool_or(is_current) AS has_current
+          FROM core.dim_customer GROUP BY customer_id
+          UNION ALL
+          SELECT station_id, bool_or(is_current) FROM core.dim_station GROUP BY station_id
+          UNION ALL
+          SELECT charge_point_id, bool_or(is_current)
+          FROM core.dim_charge_point GROUP BY charge_point_id
+          UNION ALL
+          SELECT tariff_plan_id, bool_or(is_current)
+          FROM core.dim_tariff_plan GROUP BY tariff_plan_id
+      )
+      SELECT
+          count(*)                                    AS rows_evaluated,
+          count(*) FILTER (WHERE NOT k.has_current)   AS rows_failed
+      FROM keys AS k
+    description: >-
+      Every business key has at least one current row. The partial unique index
+      prevents TWO current rows but cannot prevent ZERO - only the merge's
+      single transaction does, and this rule is what proves it held. A crash
+      between expiring the old version and inserting the new one would show up
+      here and nowhere else.
+
+  - rule_code: DIM_NO_OVERLAPPING_VERSIONS
+    entity: core.dim
+    layer: core
+    rule_type: rule
+    scope: dataset
+    severity: error
+    rule_sql: |
+      WITH overlapping_versions AS (
+          SELECT count(*) AS n FROM core.dim_customer AS a
+          INNER JOIN core.dim_customer AS b
+              ON a.customer_id = b.customer_id
+              AND a.customer_sk < b.customer_sk
+              AND tstzrange(a.effective_from_utc, a.effective_to_utc)
+                  && tstzrange(b.effective_from_utc, b.effective_to_utc)
+          UNION ALL
+          SELECT count(*) FROM core.dim_charge_point AS a
+          INNER JOIN core.dim_charge_point AS b
+              ON a.charge_point_id = b.charge_point_id
+              AND a.charge_point_sk < b.charge_point_sk
+              AND tstzrange(a.effective_from_utc, a.effective_to_utc)
+                  && tstzrange(b.effective_from_utc, b.effective_to_utc)
+          UNION ALL
+          SELECT count(*) FROM core.dim_tariff_plan AS a
+          INNER JOIN core.dim_tariff_plan AS b
+              ON a.tariff_plan_id = b.tariff_plan_id
+              AND a.tariff_plan_sk < b.tariff_plan_sk
+              AND tstzrange(a.effective_from_utc, a.effective_to_utc)
+                  && tstzrange(b.effective_from_utc, b.effective_to_utc)
+          UNION ALL
+          SELECT count(*) FROM core.dim_station AS a
+          INNER JOIN core.dim_station AS b
+              ON a.station_id = b.station_id
+              AND a.station_sk < b.station_sk
+              AND tstzrange(a.effective_from_utc, a.effective_to_utc)
+                  && tstzrange(b.effective_from_utc, b.effective_to_utc)
+      )
+      SELECT 1 AS rows_evaluated, COALESCE(sum(o.n), 0) AS rows_failed FROM overlapping_versions AS o
+    description: >-
+      No business key has two versions whose validity ranges overlap. Overlaps
+      would make the point-in-time join return two rows for one session and
+      silently double every measure on it.
+
+  - rule_code: DIM_INFERRED_MEMBER_RATIO
+    entity: core.dim_charge_point
+    layer: core
+    rule_type: ratio
+    scope: dataset
+    severity: warn
+    rule_sql: |
+      SELECT
+          count(*)                                    AS rows_evaluated,
+          count(*) FILTER (WHERE d.is_inferred)       AS rows_failed,
+          round(
+              100.0 * count(*) FILTER (WHERE d.is_inferred) / nullif(count(*), 0), 4
+          )                                           AS observed_value
+      FROM core.dim_charge_point AS d
+      WHERE d.is_current AND d.charge_point_sk > 0
+    params: {max_value: 5.0}
+    description: >-
+      Share of charge points that exist only as inferred placeholders. A few
+      are expected - devices get commissioned before the CMS extract catches
+      up. A growing share means the master-data feed is falling behind.

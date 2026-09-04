@@ -1,2 +1,0 @@
-# Placeholder so that `pip install -e .` resolves before Phase 1 creates
-# src/volthive/. Delete once the package exists.

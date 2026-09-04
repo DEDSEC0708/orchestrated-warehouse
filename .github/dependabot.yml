@@ -1,0 +1,48 @@
+# ===========================================================================
+# Dependabot.
+#
+# WEEKLY, NOT DAILY. This project pins Airflow against its official
+# constraints file, so a bump to a transitive dependency is not a one-line
+# change - it is a change that has to be re-tested against those constraints.
+# Daily pull requests on a repository nobody merges daily produce a backlog
+# that gets closed in bulk, which is worse than no automation.
+#
+# GROUPED. One pull request per ecosystem per week, so CI runs once and the
+# diff is reviewable as a set rather than as fifteen separate one-line bumps.
+# ===========================================================================
+
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      # Airflow and its providers move together and must be tested together;
+      # bumping a provider without the core it was built against is how a DAG
+      # stops importing.
+      airflow:
+        patterns: ["apache-airflow*"]
+      dev-tooling:
+        patterns: ["ruff", "mypy", "pytest*", "sqlfluff", "pre-commit", "types-*"]
+      runtime:
+        patterns: ["*"]
+        exclude-patterns: ["apache-airflow*", "ruff", "mypy", "pytest*", "sqlfluff", "pre-commit"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: docker
+    directory: "/docker/airflow"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "docker"

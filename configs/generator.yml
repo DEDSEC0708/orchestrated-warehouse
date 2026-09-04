@@ -1,0 +1,214 @@
+# ===========================================================================
+# generator.yml - the synthetic source-data simulator.
+#
+# ALL DATA IN THIS PROJECT IS SYNTHETIC. VoltHive Energy is fictional. Emails
+# use the RFC-reserved @example.invalid TLD, which can never resolve, and phone
+# numbers use a reserved prefix. No real customer, vehicle or company data is
+# used anywhere.
+#
+# DETERMINISM IS THE POINT. Every random draw comes from a seeded generator, so
+# two people running this project get byte-identical files and therefore
+# identical warehouses - which is what makes the integration tests able to
+# assert exact quarantine counts rather than approximate ones.
+#
+# DEFECT RATES ARE DELIBERATE. Each one below maps to a real, documented
+# failure mode of OCPP charging telemetry, and each one has a data-quality rule
+# that catches it. The generator writes a ground-truth manifest recording
+# exactly how many of each it injected, so the tests assert against an
+# INDEPENDENT oracle rather than against the pipeline's own output.
+# ===========================================================================
+
+seed: 42
+
+profiles:
+  # Full build. ~18 months, ~1.04M sessions, ~11.5M meter samples.
+  default:
+    start_date: "2025-01-01"
+    end_date: "2026-06-30"
+    cities: [BLR, DEL, MUM, HYD, PNQ, MAA, AMD, CCU]
+    stations: 120
+    customers: 25000
+    sessions_per_day: 1900
+
+  # For 8 GB laptops and for a quick end-to-end look. ~3 months, 2 cities.
+  small:
+    start_date: "2026-04-01"
+    end_date: "2026-06-30"
+    cities: [BLR, HYD]
+    stations: 24
+    customers: 2500
+    sessions_per_day: 260
+
+  # For CI and the integration suite. Small enough to generate and load in
+  # seconds, large enough that every defect type still appears at least once.
+  #
+  # defect_overrides raises the rarest rates so that a seven-day window still
+  # contains every defect. Without it, a 0.05%-rate defect over ~600 sessions
+  # appears zero times about half the time - and a data-quality rule whose
+  # trigger was never generated PASSES VACUOUSLY. A green test suite that
+  # proves nothing is worse than a red one.
+  tiny:
+    start_date: "2026-06-01"
+    end_date: "2026-06-07"
+    cities: [BLR, HYD]
+    stations: 6
+    customers: 200
+    sessions_per_day: 90
+    # Every rate here is set so the EXPECTED COUNT over this profile's
+    # population is at least ~8, which puts the probability of zero
+    # occurrences below 0.1%. Anything less and the suite is flaky in the
+    # worst possible direction: the run that generates no instance of a defect
+    # is the run where its rule passes without ever being evaluated.
+    #
+    # Populations differ per defect, which is why the numbers differ. The CDR
+    # rates apply to ~550 sessions, the CMS rates to 200 customers, and the
+    # meter rates to ~11,000 samples - so 0.2% is generous for one and useless
+    # for another.
+    defect_overrides:
+      cdr_corrected_version_pct: 2.0
+      cdr_energy_out_of_range_pct: 1.5
+      cdr_implausible_duration_pct: 1.5
+      cdr_time_inversion_pct: 1.5
+      cdr_unknown_charge_point_pct: 1.5
+      cdr_negative_energy_pct: 1.5      # 0.4% x 550 sessions = 2.2 expected
+      cdr_missing_stop_pct: 1.5         # 0.7% x 550 sessions = 3.9 expected
+      meter_non_monotonic_pct: 2.0
+      cms_updated_before_created_pct: 5.0  # 0.4% x 200 customers = 0.8 expected
+      cms_null_city_pct: 5.0               # 0.3% x 200 customers = 0.6 expected
+      cms_segment_casing_pct: 6.0          # 2.0% x 200 customers = 4.0 expected
+      cms_dangling_tariff_fk_pct: 3.0
+      partner_revision_pct: 15.0
+    # Same argument, applied to dimension CHANGES rather than defects. The
+    # 30 kW -> 60 kW upgrade is the headline SCD Type 2 demonstration: it is
+    # what the before/after analytics query measures and what the point-in-time
+    # join tests assert on. At the global 6% rate, restricted to DC devices
+    # that shipped at 30 kW, this profile's ~60 devices produce NO upgrade at
+    # all about a third of the time. Raising the rate here makes the behaviour
+    # present in every CI run instead of most of them.
+    change_rate_overrides:
+      charge_point_power_upgrade_pct: 70.0
+      station_reclassification_pct: 20.0
+      customer_segment_change_pct: 15.0
+
+  # Same window as tiny but with every defect rate set to zero. Used by the
+  # tests that must assert on CLEAN data - the reconciliation identity and the
+  # idempotency checksums are far easier to read when nothing is quarantined,
+  # and a rule that fires on clean data is a false positive worth catching.
+  clean:
+    start_date: "2026-06-01"
+    end_date: "2026-06-03"
+    cities: [BLR]
+    stations: 4
+    customers: 120
+    sessions_per_day: 60
+    defect_overrides:
+      cdr_exact_duplicate_pct: 0
+      cdr_corrected_version_pct: 0
+      cdr_negative_energy_pct: 0
+      cdr_missing_stop_pct: 0
+      cdr_time_inversion_pct: 0
+      cdr_kwh_unit_pct: 0
+      cdr_unknown_charge_point_pct: 0
+      cdr_implausible_duration_pct: 0
+      cdr_energy_out_of_range_pct: 0
+      meter_duplicate_sample_pct: 0
+      meter_out_of_order_pct: 0
+      meter_non_monotonic_pct: 0
+      meter_soc_out_of_range_pct: 0
+      meter_null_power_pct: 0
+      meter_orphan_sample_pct: 0
+      cms_updated_before_created_pct: 0
+      cms_null_city_pct: 0
+      cms_segment_casing_pct: 0
+      cms_dangling_tariff_fk_pct: 0
+      partner_revision_pct: 0
+
+# --- Geography -------------------------------------------------------------
+cities:
+  BLR: { name: Bengaluru,  state: Karnataka,   tier: TIER1, pincode_prefix: "5600" }
+  DEL: { name: Delhi NCR,  state: Delhi,       tier: TIER1, pincode_prefix: "1100" }
+  MUM: { name: Mumbai,     state: Maharashtra, tier: TIER1, pincode_prefix: "4000" }
+  HYD: { name: Hyderabad,  state: Telangana,   tier: TIER1, pincode_prefix: "5000" }
+  PNQ: { name: Pune,       state: Maharashtra, tier: TIER2, pincode_prefix: "4110" }
+  MAA: { name: Chennai,    state: Tamil Nadu,  tier: TIER1, pincode_prefix: "6000" }
+  AMD: { name: Ahmedabad,  state: Gujarat,     tier: TIER2, pincode_prefix: "3800" }
+  CCU: { name: Kolkata,    state: West Bengal, tier: TIER1, pincode_prefix: "7000" }
+
+# --- Fleet composition -----------------------------------------------------
+site_types:      [MALL, HIGHWAY, OFFICE, RESIDENTIAL, FLEET_DEPOT]
+site_type_weights: [30, 20, 25, 15, 10]
+
+charge_points_per_station: { min: 2, max: 12 }
+
+customer_segments:  [RETAIL, FLEET, CORPORATE]
+segment_weights:    [72, 13, 15]
+
+subscription_plans: [PAYG, PLUS, FLEET_PRO]
+
+connector_types:    [CCS2, CHAdeMO, TYPE2, BHARAT_AC001]
+connector_weights:  [55, 8, 27, 10]
+
+# --- Change history --------------------------------------------------------
+# The rates that make SCD Type 2 worth having. Every one of these is a change
+# with an analytical consequence: a relocation moves revenue between cities, a
+# power upgrade changes energy per session, a tariff revision changes what a
+# historical session cost.
+change_rates:
+  customer_relocation_pct: 4.0        # moves city/state, and possibly tier
+  customer_segment_change_pct: 3.0    # RETAIL -> CORPORATE as usage grows
+  customer_plan_change_pct: 6.0
+  customer_deactivation_pct: 2.5      # soft delete, becomes a tombstone version
+  station_reclassification_pct: 5.0   # e.g. MALL -> HIGHWAY
+  station_bay_expansion_pct: 8.0      # changes the utilisation denominator
+  charge_point_power_upgrade_pct: 6.0 # 30 kW -> 60 kW, the headline example
+  charge_point_firmware_pct: 40.0     # correlates with defect rates
+  charge_point_tariff_move_pct: 7.0   # which price list applies
+  charge_point_relocation_pct: 2.0
+  tariff_revisions_per_plan: 3        # spread across the window
+
+# --- Injected defects ------------------------------------------------------
+# Rates are fractions of the relevant population. Each maps to exactly one
+# data-quality rule, named here so the mapping is reviewable in one place.
+defects:
+  cdr_exact_duplicate_pct: 1.2        # OCPP retry storm       -> deduped, counted
+  cdr_corrected_version_pct: 0.3      # record_version = 2     -> latest wins
+  cdr_negative_energy_pct: 0.4        # meter reset            -> CDR_NEGATIVE_ENERGY
+  cdr_missing_stop_pct: 0.7           # lost connectivity      -> CDR_MISSING_STOP
+  cdr_time_inversion_pct: 0.2         # device clock drift     -> CDR_TIME_INVERSION
+  cdr_kwh_unit_pct: 3.0               # older firmware         -> CONFORMED, not rejected
+  cdr_unknown_charge_point_pct: 0.15  # not yet in the CMS     -> inferred member
+  cdr_implausible_duration_pct: 0.05  # > 24 h                 -> CDR_IMPLAUSIBLE_DURATION
+  cdr_energy_out_of_range_pct: 0.05   # > 350 kWh              -> CDR_ENERGY_OUT_OF_RANGE
+  meter_duplicate_sample_pct: 0.5     #                        -> deduped
+  meter_out_of_order_pct: 0.8         #                        -> reordered by timestamp
+  meter_non_monotonic_pct: 0.3        # mid-session reset      -> MTR_NEGATIVE_INTERVAL_ENERGY
+  meter_soc_out_of_range_pct: 0.2     #                        -> MTR_SOC_OUT_OF_RANGE
+  meter_null_power_pct: 1.0           #                        -> tolerated, column is nullable
+  meter_orphan_sample_pct: 2.0        # CDR arrives later      -> held, then MTR_ORPHAN_EXPIRED
+  cms_updated_before_created_pct: 0.4 #                        -> CMS_UPDATED_BEFORE_CREATED (warn)
+  cms_null_city_pct: 0.3              #                        -> tolerated, nullable
+  cms_segment_casing_pct: 2.0         # "Fleet" vs "FLEET"     -> CONFORMED in staging
+  cms_dangling_tariff_fk_pct: 0.5     # bad admin edit         -> unknown member + warn
+  partner_revision_pct: 4.0           # billing dispute        -> the 7-day lookback exists for this
+
+# --- Roaming ---------------------------------------------------------------
+roaming:
+  session_pct: 6.0
+  partners: [STATIQ, CHARGEZONE, PLUGO]
+  # Records revised for up to a week after the fact - which is precisely why
+  # this source's lookback is 7 days and the file sources' is 3.
+  revision_window_days: 7
+
+# --- Schema evolution ------------------------------------------------------
+# From this date, firmware 3.5 adds a field the pipeline has never seen. The
+# payload-preserving raw layer captures it losslessly, staging ignores it, and
+# SCHEMA_DRIFT_OCPP raises a WARNING naming the new key. This is the single
+# best argument for the JSONB raw design, so the generator exercises it.
+schema_evolution:
+  new_field_from_date: "2026-05-01"
+  new_field_name: grid_carbon_intensity
+
+# --- Telemetry shape -------------------------------------------------------
+meter:
+  sample_interval_seconds: 300
+  max_samples_per_session: 40

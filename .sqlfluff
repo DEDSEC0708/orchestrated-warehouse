@@ -15,6 +15,7 @@ templater = jinja
 max_line_length = 120
 # Keep output actionable rather than exhaustive while the SQL surface is small.
 large_file_skip_byte_limit = 30000
+exclude_rules = LT01,LT02,LT05,LT09,LT12,LT14,CP02,CP03,AL03,ST03,AM04,ST06,ST09,RF03
 
 [sqlfluff:indentation]
 indented_joins = false
@@ -49,3 +50,48 @@ aliasing = explicit
 
 [sqlfluff:rules:ambiguous.column_references]
 group_by_and_order_by_style = explicit
+
+# ---------------------------------------------------------------------------
+# RULE SELECTION (Phase 14)
+#
+# The rules below are DISABLED, each for a stated reason. A linter whose
+# output nobody reads is worse than no linter, and 3,700 layout complaints
+# across 55 files is exactly how that happens. What remains are the rules that
+# find real defects - ambiguity, unqualified references, inconsistent GROUP BY
+# - and those are held at zero.
+#
+#   LT01, LT02, LT09, LT12, LT14   pure whitespace and indentation. The DDL and
+#          the transformation SQL align column definitions, aliases and inline
+#          comments into columns on purpose, because that is what makes a
+#          200-line CREATE TABLE readable. sqlfluff's layout rules would
+#          collapse that alignment, and `sqlfluff fix` would rewrite 53 files
+#          to do it. The alignment is worth more than the uniformity.
+#
+#   LT05   line length. Every violation is inside a COMMENT ON string, which
+#          is a single quoted literal that cannot be wrapped without changing
+#          the stored text. max_line_length above still applies to code.
+#
+#   CP02, CP03  identifier and function capitalisation. Flags `LANGUAGE SQL`
+#          and PL/pgSQL argument names as "unquoted identifiers must be lower
+#          case". They are neither wrong nor identifiers.
+#
+#   AL03   column expression without an alias. Almost every instance is an
+#          INSERT ... SELECT, where the target column list already names the
+#          columns and an alias would be noise the parser discards.
+#
+#   ST03   "CTE defined but not used". Every instance is a DATA-MODIFYING CTE
+#          - an INSERT INTO ... RETURNING used for its side effect, which is
+#          how the quarantine split stays one statement. sqlfluff cannot see
+#          that a CTE was used by executing it.
+#
+#   AM04   "query produces an unknown number of result columns", raised by
+#          `SELECT d.*` inside the SCD2 merges. The star is deliberate there:
+#          the CTE chain carries a wide row forward and re-listing forty
+#          columns at each step is how a column silently goes missing.
+#
+#   ST06, ST09  select-target and join-condition ordering. Style, not defect.
+#
+#   RF03   flags whole-row references like `to_jsonb(s)` as unqualified
+#          columns. That is a PostgreSQL composite-value reference, not a
+#          column, and qualifying it would change its meaning.
+# ---------------------------------------------------------------------------
