@@ -21,11 +21,37 @@ name: volthive
 # --- shared Airflow configuration -------------------------------------------
 # All three Airflow services run the same image with the same environment and
 # differ only in their command. The anchor keeps them from drifting apart.
+#
+# THE ANCHOR CARRIES THE IMAGE NAME BUT NOT THE BUILD.
+#
+# Putting `build:` here too is the obvious thing to do, and it is what the
+# upstream Airflow compose file does. It is also a race. Compose delegates
+# builds to buildx bake, which turns every service with a `build:` section
+# into its own target and runs them CONCURRENTLY. Three targets then export
+# the same image name at the same time, and the image store rejects the
+# losers:
+#
+#   target airflow-init: failed to solve:
+#   image "docker.io/volthive/airflow:2.10.5-local": already exists
+#
+# One service shows CANCELED, the others ERROR, and which one wins varies
+# between runs. The classic (pre-bake) builder deduplicated identical build
+# definitions, which is why this shape survived for years before surfacing.
+#
+# So exactly ONE service owns the build - airflow-init, below - and the other
+# two consume the image it produces. That is not a workaround: the dependency
+# graph already requires airflow-init to finish before either long-running
+# service starts (`service_completed_successfully`), so the image is
+# guaranteed to exist by the time they are created. The build order is now
+# stated once, in the place that already enforced it.
 x-airflow-common: &airflow-common
   image: volthive/airflow:2.10.5-local
-  build:
-    context: .
-    dockerfile: docker/airflow/Dockerfile
+  # Never reach a registry for this tag. It is built locally and only locally;
+  # `volthive/airflow` is not a repository this project publishes. Without
+  # this, a missing image sends Docker to Docker Hub, where it would either
+  # fail confusingly or - worse - succeed against a stranger's image that
+  # happens to occupy that name.
+  pull_policy: never
   # UID must match the host user on Linux, or bind-mounted files become
   # root-owned and undeletable. Group 0 is what the base image expects.
   # Docker Desktop on Windows and macOS handles ownership itself.
@@ -177,6 +203,17 @@ services:
   airflow-init:
     <<: *airflow-common
     container_name: volthive-airflow-init
+    # THE SINGLE BUILD OWNER. See the note on x-airflow-common for why exactly
+    # one service may declare this. airflow-init is the right owner because it
+    # already runs first and to completion: both long-running services declare
+    # `airflow-init: {condition: service_completed_successfully}`, so the image
+    # cannot be missing when they start. `pull_policy` is deliberately dropped
+    # here - a service that builds its own image must not be told never to
+    # obtain one.
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    pull_policy: build
     # A failed bootstrap must stay failed and visible, not restart in a loop.
     restart: "no"
     depends_on:

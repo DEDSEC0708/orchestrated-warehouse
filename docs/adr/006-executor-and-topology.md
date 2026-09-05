@@ -74,3 +74,44 @@ teams. None applies here.
 | **SequentialExecutor** | The default with SQLite; runs exactly one task at a time and cannot demonstrate parallel task groups or a realistic DAG shape. |
 | **KubernetesExecutor** | Explicitly out of scope, and would break the "runs on a laptop" requirement. |
 | **`airflow standalone`** | One command, but it bundles SQLite and a dev server, hides the components, and teaches nothing about how the pieces fit. |
+
+## Addendum: one image, one builder
+
+The three Airflow services share one image, `volthive/airflow:2.10.5-local`,
+built from `docker/airflow/Dockerfile`. They differ only in their command,
+which is what the `x-airflow-common` anchor exists to keep true.
+
+**Only `airflow-init` declares the `build:`.** The anchor carries the image
+name; it deliberately does not carry the build.
+
+Putting the build on the anchor is the obvious expression of "these are the
+same image", and it is what the upstream Airflow compose file does. It is also
+a race. Compose delegates builds to buildx bake, which turns every service
+with a `build:` section into an independent target and runs them concurrently.
+Three targets exporting the same image name collide in the image store:
+
+```
+target airflow-init: failed to solve:
+image "docker.io/volthive/airflow:2.10.5-local": already exists
+```
+
+One service reports `CANCELED`, the others `ERROR`, and which one wins varies
+between runs. The pre-bake builder deduplicated identical build definitions,
+which is why this shape worked for years and then began failing.
+
+`airflow-init` is the right owner rather than an arbitrary one: the dependency
+graph already requires it to finish before either long-running service starts
+(`condition: service_completed_successfully`), so the image cannot be missing
+when the consumers are created. The build order is asserted once, in the place
+that already enforced the run order.
+
+Two consequences follow, both encoded as tests in
+`tests/unit/test_compose_config.py`:
+
+- The consumers set `pull_policy: never`. `volthive/airflow` is not a
+  repository this project publishes, so a missing image must fail locally
+  rather than send Docker to Docker Hub — where it would either fail
+  confusingly or succeed against a stranger's image occupying that name.
+- `make up` builds as a separate step rather than passing `--build`, so the
+  image exists regardless of whether `--build` reaches a service that is
+  present only as a dependency.

@@ -123,12 +123,21 @@ version-check:
 build:
 	docker compose build
 
+# Building is a SEPARATE step, not `up --build`.
+#
+# Only airflow-init declares a build (see docker-compose.yml for why exactly
+# one service may). `docker compose build` with no arguments builds every
+# buildable service in the project, so the image is guaranteed to exist before
+# anything starts - rather than depending on whether `--build` happens to
+# include a service that is present only as a dependency. It also separates a
+# build failure from a startup failure, which are different problems.
+#
 # airflow-init is deliberately NOT named in the --wait list: it is a one-shot
 # container that exits 0, and `--wait` waits for services to become RUNNING or
 # healthy, which a completed container never does. It still runs, because both
 # Airflow services declare service_completed_successfully on it.
-up:
-	docker compose up -d --build --wait --wait-timeout 300 postgres airflow-scheduler airflow-webserver
+up: build
+	docker compose up -d --wait --wait-timeout 300 postgres airflow-scheduler airflow-webserver
 
 down:
 	docker compose down

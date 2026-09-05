@@ -176,6 +176,119 @@ def test_postgres_healthcheck_goes_over_tcp(services: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------
 
 
+def test_exactly_one_service_builds_each_image() -> None:
+    """Two services building the same tag is a build-time RACE, not a duplicate.
+
+    Compose delegates builds to buildx bake, which makes every service with a
+    `build:` section its own target and runs them concurrently. Targets that
+    export the same image name collide in the image store:
+
+        target airflow-init: failed to solve:
+        image "docker.io/volthive/airflow:2.10.5-local": already exists
+
+    One service reports CANCELED, the others ERROR, and the winner varies run
+    to run. The pre-bake builder deduplicated identical build definitions,
+    which is why the upstream Airflow compose shape - `build:` on a shared
+    anchor - worked for years and then stopped.
+    """
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    builders: dict[str, list[str]] = {}
+    for name, service in compose["services"].items():
+        if service.get("build"):
+            builders.setdefault(str(service["image"]), []).append(name)
+
+    contested = {image: names for image, names in builders.items() if len(names) > 1}
+    assert not contested, (
+        "these images are built by more than one service, which races on export: " f"{contested}"
+    )
+
+
+def test_every_service_image_is_either_built_or_pullable() -> None:
+    """A service that neither builds nor can pull its image cannot start.
+
+    The other half of the rule above: once only one service owns the build,
+    the consumers must still resolve the same tag locally.
+    """
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    built = {str(s["image"]) for s in compose["services"].values() if s.get("build")}
+    for name, service in compose["services"].items():
+        image = str(service["image"])
+        if service.get("build"):
+            continue
+        # Either a registry image (postgres:16-alpine) or one built in-project.
+        assert (
+            image in built or "/" not in image.split(":")[0].rstrip("/") or ":" in image
+        ), f"service '{name}' image '{image}' is neither built here nor a registry image"
+
+
+def test_locally_built_images_are_never_pulled_from_a_registry() -> None:
+    """`volthive/airflow` is not a repository this project publishes.
+
+    Left at the default pull policy, a missing image sends Docker to Docker
+    Hub - which either fails confusingly or, worse, succeeds against whatever
+    stranger's image occupies that name. Every service using the locally built
+    tag must therefore declare an explicit policy.
+    """
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    local_images = {str(s["image"]) for s in compose["services"].values() if s.get("build")}
+
+    for name, service in compose["services"].items():
+        if str(service["image"]) not in local_images:
+            continue
+        policy = service.get("pull_policy")
+        assert policy in {"never", "build"}, (
+            f"service '{name}' uses the locally built image "
+            f"'{service['image']}' with pull_policy={policy!r}; expected "
+            "'never' (consumer) or 'build' (the build owner)"
+        )
+
+
+def test_the_build_owner_runs_before_its_consumers() -> None:
+    """The single build owner must be ordered ahead of everything using it.
+
+    This is what makes one-service-builds safe: the consumers cannot be
+    created before the image exists, because compose already refuses to start
+    them until the owner has completed successfully.
+    """
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    services = compose["services"]
+    owners = {name: str(s["image"]) for name, s in services.items() if s.get("build")}
+
+    for name, service in services.items():
+        image = str(service["image"])
+        if service.get("build") or image not in owners.values():
+            continue
+        owner = next(o for o, img in owners.items() if img == image)
+        depends_on = service.get("depends_on") or {}
+        assert owner in depends_on, (
+            f"service '{name}' uses the image built by '{owner}' but does not "
+            f"depend on it, so it could be created before the image exists"
+        )
+        assert depends_on[owner]["condition"] in {
+            "service_completed_successfully",
+            "service_healthy",
+        }
+
+
+def test_makefile_up_builds_before_starting() -> None:
+    """`make up` must not rely on `--build` reaching a dependency-only service.
+
+    Only airflow-init declares a build, and `make up` names the two
+    long-running services. Building explicitly removes any dependence on
+    whether `--build` covers services pulled in through depends_on.
+    """
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    up_block = re.search(r"^up:.*?(?=^\w[\w-]*:)", makefile, re.M | re.S)
+    assert up_block, "no `up:` target found in the Makefile"
+    body = up_block.group(0)
+
+    assert "--build" not in body, (
+        "`make up` still passes --build; build explicitly instead so the image "
+        "is guaranteed to exist regardless of dependency resolution"
+    )
+    assert re.match(r"^up:\s*build\b", body), "`up` should depend on the `build` target"
+
+
 def test_no_literal_credentials_in_compose_file() -> None:
     """Every credential must arrive through interpolation, never as a literal."""
     content = COMPOSE_FILE.read_text(encoding="utf-8")

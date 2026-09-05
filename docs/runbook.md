@@ -322,6 +322,38 @@ make clean && make up && make run-clean
 
 ---
 
+## Symptom: `image "volthive/airflow:2.10.5-local": already exists` during build
+
+Seen as one Airflow service reporting `CANCELED` during export and the others
+`ERROR`, with the winner varying between runs.
+
+This should no longer be reachable. It happened when more than one service
+declared a `build:` section producing the same image tag. Compose hands builds
+to buildx bake, which makes each such service its own target and runs them
+**concurrently** — so several targets exported the same image name at once and
+the image store rejected all but one. The older, pre-bake builder
+deduplicated identical build definitions, which is why the shape worked for
+years before failing.
+
+Exactly one service now owns that build (`airflow-init`), and the two
+long-running services consume the image it produces. If you see this again,
+something has re-added a `build:` to `x-airflow-common` or to a second
+service. Confirm with the build plan rather than by reading the file:
+
+```bash
+docker compose build --print
+```
+
+The `target` object must contain exactly one entry per image tag. Two entries
+sharing a `tags` value is the bug.
+`tests/unit/test_compose_config.py::test_exactly_one_service_builds_each_image`
+asserts this, so it should fail before you ever get here.
+
+Note that this is a build-time collision, **not** a stale-image problem —
+`docker system prune` does not prevent it and is not the fix.
+
+---
+
 ## Things that are safe
 
 - Re-running any stage over any window.
