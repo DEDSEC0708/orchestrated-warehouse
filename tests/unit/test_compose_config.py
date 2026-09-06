@@ -161,6 +161,108 @@ def test_bootstrap_container_does_not_restart(services: dict[str, Any]) -> None:
     assert str(services["airflow-init"]["restart"]) == "no"
 
 
+# --------------------------------------------------------------------------
+# The image entrypoint contract
+#
+# `user: "${AIRFLOW_UID}:0"` is only legal because the Airflow image's
+# entrypoint appends a /etc/passwd entry for the running UID before handing
+# over. Airflow refuses to run as a UID it cannot name: getpass.getuser()
+# raises KeyError, and airflow/utils/platform.py::getuser() turns that into an
+# AirflowConfigException from _build_metrics(), which the @action_cli decorator
+# calls before every subcommand body. `airflow db migrate` therefore fails
+# before opening a connection.
+#
+# A service that replaces `entrypoint` opts out of that silently - the compose
+# file still validates, the image still builds, and the container exits 1 with
+# a healthy database. These tests make the opt-out impossible to reintroduce.
+# --------------------------------------------------------------------------
+
+INIT_SCRIPT = REPO_ROOT / "docker" / "airflow" / "init.sh"
+
+
+def _airflow_services(services: dict[str, Any]) -> dict[str, Any]:
+    return {name: spec for name, spec in services.items() if name.startswith("airflow-")}
+
+
+def test_no_airflow_service_replaces_the_image_entrypoint(services: dict[str, Any]) -> None:
+    """The entrypoint is what makes an arbitrary AIRFLOW_UID work at all.
+
+    Overriding it drops create_system_user_if_missing, and the container dies
+    with "The user that Airflow is running as has no username".
+    """
+    overriding = {
+        name: spec["entrypoint"]
+        for name, spec in _airflow_services(services).items()
+        if "entrypoint" in spec
+    }
+    assert not overriding, (
+        f"These services replace the image entrypoint: {overriding}. "
+        "Pass the script as a command instead - the image dispatches "
+        "`bash <args>` via exec_to_bash_or_python_command_if_specified, so "
+        'command: ["bash", "/opt/airflow/init.sh"] runs it AFTER the passwd '
+        "entry, umask and db-readiness check have been set up."
+    )
+
+
+def test_bootstrap_runs_its_script_through_the_image_entrypoint(
+    services: dict[str, Any],
+) -> None:
+    """`bash` first is the image's documented escape hatch to an arbitrary command."""
+    command = services["airflow-init"]["command"]
+    assert command == ["bash", "/opt/airflow/init.sh"], command
+
+
+def test_every_airflow_service_runs_with_group_zero(services: dict[str, Any]) -> None:
+    """The passwd entry the image writes hardcodes GID 0.
+
+    A non-zero GID would not be able to write the log volume the image seeds.
+    """
+    for name, spec in _airflow_services(services).items():
+        assert str(spec["user"]).endswith(":0"), f"{name} runs as {spec['user']}"
+
+
+def test_bootstrap_script_tolerates_an_unmapped_uid() -> None:
+    """The script must not assume the entrypoint already ran.
+
+    It is reachable by `docker compose run --entrypoint` and by a plain
+    `docker run`, so it fixes its own precondition before calling airflow.
+    """
+    body = INIT_SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "whoami" in body and "/etc/passwd" in body
+    ), "init.sh must guard against a UID with no passwd entry."
+
+    guard_at = body.index("if ! whoami")
+    first_airflow_call = min(
+        body.index(needle) for needle in ("airflow db migrate", "airflow users", "airflow pools")
+    )
+    assert guard_at < first_airflow_call, (
+        "The passwd guard must run before the first airflow command, because "
+        "getuser() fires in the CLI decorator before any subcommand body."
+    )
+
+
+def test_bootstrap_script_never_pipes_into_grep_q() -> None:
+    """`... | grep -q` under `set -o pipefail` reports 141, not 0.
+
+    grep -q exits on first match, the upstream commands take SIGPIPE, and
+    pipefail returns the rightmost non-zero status. The guard then reads
+    "found" as "not found", `airflow users create` hits a duplicate username,
+    and set -e exits 1 - on the SECOND `make up` and every one after it.
+    """
+    body = INIT_SCRIPT.read_text(encoding="utf-8")
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    offenders = [
+        line.strip()
+        for line in code.splitlines()
+        if re.search(r"\|\s*grep\s+(-\w*q|--quiet)", line)
+    ]
+    assert not offenders, (
+        f"Pipefail-unsafe early-exit pipeline in init.sh: {offenders}. "
+        "Capture the output first and match with a here-string."
+    )
+
+
 def test_postgres_healthcheck_goes_over_tcp(services: dict[str, Any]) -> None:
     """During initdb the server listens only on a unix socket.
 
@@ -441,6 +543,156 @@ def test_the_generated_env_has_real_keys_not_placeholders(scratch_repo) -> None:
         "AIRFLOW__CORE__FERNET_KEY"
     ]
     assert first != second, "the Fernet key is not random between runs"
+
+
+# --------------------------------------------------------------------------
+# Airflow UI sign-in
+#
+# "Invalid login" against a stack whose .env plainly shows the password you
+# just typed has two possible causes, and both are project defects rather than
+# user error: the example ships a working password nobody documents, or the
+# bootstrap only consults .env on the first boot of an empty volume and lets
+# the metadata database win ever after.
+# --------------------------------------------------------------------------
+
+
+def test_the_example_ships_no_working_admin_password() -> None:
+    """A default UI password in a public repo is a real credential.
+
+    It stops being "only local" the moment anyone publishes port 8080, and
+    "change it later" is not a control. It must be generated per machine, the
+    same as the Fernet key.
+    """
+    values = _parse_env((REPO_ROOT / ".env.example").read_text(encoding="utf-8"))
+    assert (
+        values["AIRFLOW_ADMIN_PASSWORD"] == "REPLACE_ME_GENERATED_LOCALLY"
+    ), "'.env.example' must not contain a usable Airflow admin password."
+
+
+def test_the_generated_admin_password_is_real_and_random(scratch_repo) -> None:
+    assert _run_generator(scratch_repo).returncode == 0
+    first = _parse_env((scratch_repo / ".env").read_text(encoding="utf-8"))[
+        "AIRFLOW_ADMIN_PASSWORD"
+    ]
+    assert "REPLACE_ME" not in first, "the admin password was never generated"
+    assert len(first) >= 16, "the generated admin password is too short"
+    assert first.isalnum(), (
+        "the admin password must stay alphanumeric so it needs no quoting in "
+        "a .env file, a shell, or a browser form"
+    )
+
+    (scratch_repo / ".env").unlink()
+    assert _run_generator(scratch_repo).returncode == 0
+    second = _parse_env((scratch_repo / ".env").read_text(encoding="utf-8"))[
+        "AIRFLOW_ADMIN_PASSWORD"
+    ]
+    assert first != second, "the admin password is not random between runs"
+
+
+def test_the_bootstrap_refuses_an_ungenerated_admin_password() -> None:
+    """The placeholder is a non-empty string, so `${VAR:?}` accepts it.
+
+    Without an explicit check the stack boots on a password published in this
+    repository and nothing anywhere says so.
+    """
+    body = INIT_SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "REPLACE_ME_GENERATED_LOCALLY" in body
+    ), "init.sh must reject an un-generated AIRFLOW_ADMIN_PASSWORD."
+
+
+def test_the_bootstrap_reconciles_the_admin_password(services: dict[str, Any]) -> None:
+    """.env must be authoritative on every run, not only the first.
+
+    "Create if absent" makes the metadata database win over the config file
+    forever after the first boot: rotate the password in .env, run `make up`,
+    and the login is silently unchanged.
+    """
+    body = INIT_SCRIPT.read_text(encoding="utf-8")
+    assert (
+        "users reset-password" in body
+    ), "init.sh must reconcile an existing admin user's password from .env."
+
+    # The reconcile is worthless if the bootstrap does not run every time.
+    assert str(services["airflow-init"]["restart"]) == "no"
+    for name in ("airflow-scheduler", "airflow-webserver"):
+        assert (
+            services[name]["depends_on"]["airflow-init"]["condition"]
+            == "service_completed_successfully"
+        )
+
+
+def test_the_bootstrap_never_logs_the_admin_password() -> None:
+    """The username is public; the password must not reach a log or screenshot."""
+    body = INIT_SCRIPT.read_text(encoding="utf-8")
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("echo") or stripped.startswith("printf"):
+            assert (
+                "${AIRFLOW_ADMIN_PASSWORD" not in stripped
+            ), f"init.sh prints the admin password: {stripped}"
+
+
+def test_sign_in_is_documented_for_a_fresh_clone() -> None:
+    """A credential nobody can find is indistinguishable from a broken login."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert (
+        "AIRFLOW_ADMIN_PASSWORD" in readme
+    ), "README must tell a developer where the Airflow password lives."
+
+
+# --------------------------------------------------------------------------
+# UI identity
+#
+# Branding must stay inside Airflow's documented configuration. A patched
+# package or an overridden FAB template is a fork to re-do on every upgrade.
+# --------------------------------------------------------------------------
+
+#: Officially supported since 2.1 (instance_name) and 2.8/2.9 (navbar colours).
+SUPPORTED_UI_SETTINGS = {
+    "AIRFLOW__WEBSERVER__INSTANCE_NAME",
+    "AIRFLOW__WEBSERVER__NAVBAR_COLOR",
+    "AIRFLOW__WEBSERVER__NAVBAR_TEXT_COLOR",
+    "AIRFLOW__WEBSERVER__NAVBAR_HOVER_COLOR",
+    "AIRFLOW__WEBSERVER__NAVBAR_TEXT_HOVER_COLOR",
+    "AIRFLOW__WEBSERVER__NAVBAR_LOGO_TEXT_COLOR",
+}
+
+
+def test_ui_identity_uses_only_supported_settings(services: dict[str, Any]) -> None:
+    env = services["airflow-webserver"]["environment"]
+    present = {k for k in env if "NAVBAR" in k or k.endswith("INSTANCE_NAME")}
+    assert (
+        present == SUPPORTED_UI_SETTINGS
+    ), f"unexpected UI settings: {present ^ SUPPORTED_UI_SETTINGS}"
+
+
+def test_ui_customisation_does_not_patch_airflow() -> None:
+    """No overridden templates, no static-asset shadowing, no patched package.
+
+    Airflow 2.10 has no supported hook for the login page, so the project does
+    not customise it. A stable stock UI beats a fragile branded one.
+    """
+    forbidden = [
+        REPO_ROOT / "plugins",
+        REPO_ROOT / "docker" / "airflow" / "templates",
+        REPO_ROOT / "docker" / "airflow" / "static",
+    ]
+    existing = [p.name for p in forbidden if p.exists()]
+    assert not existing, f"UI override directories present: {existing}"
+
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    for marker in ("login_db.html", "site-packages/airflow", "appbuilder"):
+        assert marker not in dockerfile, f"Dockerfile appears to patch the Airflow UI ({marker})."
+
+
+def test_navbar_colours_are_valid_hex(services: dict[str, Any]) -> None:
+    """`#` survives YAML and dotenv here, but only unquoted and unspaced."""
+    env = services["airflow-webserver"]["environment"]
+    for key in SUPPORTED_UI_SETTINGS - {"AIRFLOW__WEBSERVER__INSTANCE_NAME"}:
+        raw = str(env[key])
+        default = raw.split(":-", 1)[1].rstrip("}") if ":-" in raw else raw
+        assert re.fullmatch(r"#[0-9A-Fa-f]{6}", default), f"{key} = {default!r}"
 
 
 def test_a_stale_copy_of_the_example_is_upgraded_not_refused(scratch_repo) -> None:

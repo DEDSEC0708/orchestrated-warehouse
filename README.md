@@ -472,17 +472,46 @@ make verify                    # asserts the privilege model is what it claims
 ```
 
 **There is no `cp .env.example .env` step.** `generate_env.sh` reads the
-example and writes `.env` itself, replacing the two placeholders that must be
-cryptographically random — the Fernet key that encrypts stored connection
-passwords, and the webserver's session-signing key. Copying the file first
-would leave both at `REPLACE_ME_GENERATED_LOCALLY`, which Docker Compose
-accepts (it is a non-empty string) and which is exactly the weakness the
-script exists to remove.
+example and writes `.env` itself, replacing the three placeholders that must
+be generated per machine — the Fernet key that encrypts stored connection
+passwords, the webserver's session-signing key, and the Airflow UI admin
+password. Copying the file first would leave all three at
+`REPLACE_ME_GENERATED_LOCALLY`, which Docker Compose accepts (it is a
+non-empty string) and which is exactly the weakness the script exists to
+remove.
 
 Every other value comes from `.env.example` and works out of the box, so a
 first run needs no credentials you have to invent. The database passwords are
 visible local-development placeholders; change them before the stack is
 reachable by anyone else.
+
+### Signing in to Airflow
+
+Open <http://localhost:8080>.
+
+| | |
+|---|---|
+| **Username** | `admin` — fixed, and set by `AIRFLOW_ADMIN_USER` |
+| **Password** | generated into your own `.env`; read it back with the command below |
+
+```bash
+grep AIRFLOW_ADMIN_PASSWORD .env
+```
+
+The password is **not** in `.env.example`, is never printed by the bootstrap,
+and never appears in `docker compose logs` — a default UI password committed to
+a public repository is a real credential the moment anyone publishes port 8080,
+and "change it later" is not a control. `docker/airflow/init.sh` refuses to
+start while the placeholder is still in place, so the stack cannot come up on a
+credential that is public in this repository.
+
+To rotate it, edit `AIRFLOW_ADMIN_PASSWORD` in `.env` and run `make up`. The
+bootstrap **reconciles** the account to whatever `.env` says on every run
+rather than only creating it when absent, so the file stays authoritative
+instead of being silently overruled by the metadata database after first boot.
+`bash scripts/generate_env.sh --force` issues a fresh one, at the cost of a new
+Fernet key — which invalidates any connection password already stored in the
+Airflow metadata database.
 
 `make up` does not return until PostgreSQL and both Airflow services report
 healthy, so there is no `sleep` and no guessing. `make verify` then checks

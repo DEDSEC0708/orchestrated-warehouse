@@ -354,6 +354,112 @@ Note that this is a build-time collision, **not** a stale-image problem —
 
 ---
 
+## Symptom: `service "airflow-init" didn't complete successfully: exit 1`
+
+Postgres is healthy, the image built, and the scheduler and webserver sit at
+`Created` because they gate on the bootstrap finishing.
+
+Read the bootstrap's own output first — it is the only place the real error
+appears, and `docker compose up` does not show it:
+
+```bash
+docker compose logs airflow-init
+```
+
+**If it says the user has no username:**
+
+```
+airflow.exceptions.AirflowConfigException: The user that Airflow is running as
+has no username; you must run Airflow as a full user, with a username and home
+directory, in order for it to function properly.
+```
+
+then something is running an Airflow container as a UID with no `/etc/passwd`
+entry, and without the image's entrypoint, which is what creates that entry
+(ADR-017). `AIRFLOW_UID` in `.env` is whoever ran `scripts/generate_env.sh`, so
+it is normally *not* a UID the image knows. Check what actually starts:
+
+```bash
+docker compose config | grep -E 'entrypoint|command|user:'
+```
+
+No Airflow service may set `entrypoint`. The bootstrap runs as
+`command: ["bash", "/opt/airflow/init.sh"]`, which the image dispatches after
+writing the passwd entry. `tests/unit/test_compose_config.py` asserts this, so
+it should fail long before you reach this page.
+
+Do **not** work around it by setting `AIRFLOW_UID=50000`, by running the
+service as root, or by deleting containers and volumes. The first two only hide
+it for one machine, and none of them is the bug.
+
+**If it says the username already exists:**
+
+```
+airflow command error: the user admin already exists
+```
+
+then the existence guard in `init.sh` has been rewritten as a pipeline into
+`grep -q`. Under `set -o pipefail` that returns 141 rather than 0, because
+`grep -q` exits on the first match and the upstream commands take `SIGPIPE`, so
+the guard reports "not found" for a user that exists. Capture the list into a
+variable and match it with a here-string. Note the shape of this failure: the
+first `make up` on an empty database succeeds and every later one fails.
+
+**Anything else:** the bootstrap does three things — `db migrate`, create the
+admin user, ensure `warehouse_pool` — and each logs a `[airflow-init]` line
+before it starts, so the last line printed names the step that failed. The
+container is safe to re-run once the cause is fixed:
+
+```bash
+docker compose up airflow-init
+```
+
+---
+
+## Symptom: the Airflow UI says "Invalid login"
+
+The username is `admin`. The password is in your own `.env`, which is
+git-ignored and generated per machine:
+
+```bash
+grep AIRFLOW_ADMIN_PASSWORD .env
+```
+
+It is deliberately **not** in `.env.example` and is never printed by the
+bootstrap or by `generate_env.sh`, so there is nowhere else to look and nothing
+to guess. If that value is what you typed and it still fails, work down:
+
+**Does the account exist, and is it an Admin?**
+
+```bash
+docker compose run --rm airflow-init bash -c 'airflow users list'
+```
+
+**Is the stack reading the `.env` you just edited?** Compose reads it at
+`up` time, not at login time — an edit needs a restart:
+
+```bash
+docker compose config | grep AIRFLOW_ADMIN_USER   # what the container will get
+make up                                            # reconciles the password
+```
+
+The bootstrap resets the admin password from `.env` on **every** run, so a
+disagreement between the file and the metadata database cannot persist past one
+`make up`. If it does, the bootstrap did not run — check that it completed:
+
+```bash
+docker compose logs airflow-init | tail -20
+```
+
+Its last lines name the UI URL and the username. They never name the password.
+
+**Do not** "fix" this by disabling authentication, by setting
+`AIRFLOW__WEBSERVER__AUTHENTICATE=False`, or by deleting the pgdata volume.
+The first two remove the control rather than the fault; the third destroys the
+warehouse to reset a password that one `make up` already resets.
+
+---
+
 ## Things that are safe
 
 - Re-running any stage over any window.

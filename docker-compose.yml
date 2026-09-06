@@ -78,6 +78,26 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?run scripts/generate_env.sh to generate a secret key}
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG:-False}
 
+    # --- UI identity ---------------------------------------------------------
+    # Cosmetic, and deliberately the whole of the customisation. Every one of
+    # these is a documented Airflow setting (instance_name since 2.1, the
+    # navbar colours since 2.8/2.9), so the UI stays stock Airflow with a
+    # different name and palette - no overridden templates, no patched
+    # package, nothing to re-do on the next upgrade.
+    #
+    # instance_name replaces the word "Airflow" in the navbar AND in the
+    # browser tab title on every page. The login screen renders the same
+    # navbar, so it picks up the project identity for free - which is why
+    # there is no login-page template override here. Airflow 2.10 has no
+    # supported hook for that, and an unsupported one would be a fragile fork
+    # of FAB's login_db.html for the sake of a logo.
+    AIRFLOW__WEBSERVER__INSTANCE_NAME: ${AIRFLOW__WEBSERVER__INSTANCE_NAME:-VoltHive - Orchestrated Warehouse}
+    AIRFLOW__WEBSERVER__NAVBAR_COLOR: ${AIRFLOW__WEBSERVER__NAVBAR_COLOR:-#0E3B34}
+    AIRFLOW__WEBSERVER__NAVBAR_TEXT_COLOR: ${AIRFLOW__WEBSERVER__NAVBAR_TEXT_COLOR:-#E8F1EE}
+    AIRFLOW__WEBSERVER__NAVBAR_HOVER_COLOR: ${AIRFLOW__WEBSERVER__NAVBAR_HOVER_COLOR:-#155047}
+    AIRFLOW__WEBSERVER__NAVBAR_TEXT_HOVER_COLOR: ${AIRFLOW__WEBSERVER__NAVBAR_TEXT_HOVER_COLOR:-#FFFFFF}
+    AIRFLOW__WEBSERVER__NAVBAR_LOGO_TEXT_COLOR: ${AIRFLOW__WEBSERVER__NAVBAR_LOGO_TEXT_COLOR:-#E8F1EE}
+
     # --- connections, injected as environment URIs ---------------------------
     # Never added to the metadata database with `airflow connections add`: that
     # would store a second, Fernet-encrypted copy of each password whose key
@@ -228,9 +248,53 @@ services:
       AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.invalid}
       AIRFLOW_ADMIN_FIRSTNAME: ${AIRFLOW_ADMIN_FIRSTNAME:-Local}
       AIRFLOW_ADMIN_LASTNAME: ${AIRFLOW_ADMIN_LASTNAME:-Admin}
-    # Baked into the image and marked executable there, so a Windows checkout
-    # without the executable bit cannot break it.
-    entrypoint: /opt/airflow/init.sh
+    # THE BOOTSTRAP RUNS AS A COMMAND, NOT AS AN ENTRYPOINT.
+    #
+    # This service used to say `entrypoint: /opt/airflow/init.sh`, which
+    # REPLACED the image's own /entrypoint. That looks harmless and is not:
+    # the image's entrypoint is what makes `user: "<arbitrary-uid>:0"` legal
+    # in the first place. Before dispatching a command it runs
+    #
+    #   check_uid_gid                 - refuse an unusable uid/gid pair
+    #   umask 0002                    - keep new dirs group-writable, so the
+    #                                   other Airflow containers can write the
+    #                                   log volume this one seeds
+    #   create_system_user_if_missing - append a /etc/passwd entry for the
+    #                                   running UID and export HOME
+    #   wait_for_airflow_db           - the image's own metadata-db readiness
+    #                                   check (CONNECTION_CHECK_MAX_COUNT)
+    #
+    # Only the third of those matters for correctness here, and it is decisive.
+    # AIRFLOW_UID comes from .env and is whatever `id -u` returned on the
+    # machine that ran scripts/generate_env.sh - 1007, 1000, 501, anything.
+    # That UID does not exist in the image's /etc/passwd, so with the image
+    # entrypoint bypassed, `getpass.getuser()` raises KeyError, and Airflow
+    # turns that into a hard failure in airflow/utils/platform.py::getuser():
+    #
+    #   airflow.exceptions.AirflowConfigException: The user that Airflow is
+    #   running as has no username; you must run Airflow as a full user, with
+    #   a username and home directory, in order for it to function properly.
+    #
+    # getuser() is called by _build_metrics() in airflow/utils/cli.py, which
+    # the @action_cli decorator runs BEFORE the subcommand body - so `airflow
+    # db migrate` failed before it opened a single connection, and the service
+    # exited 1 with Postgres perfectly healthy.
+    #
+    # The scheduler and webserver were never affected: they only set `command`,
+    # so they kept the image entrypoint and got their passwd entry. That
+    # asymmetry is exactly the bug - one service quietly opted out of a
+    # contract the other two depend on.
+    #
+    # `bash` as the first argument is the image's documented escape hatch:
+    # exec_to_bash_or_python_command_if_specified() shifts it off and runs
+    # `exec /bin/bash "$@"`, after all four steps above have happened. So the
+    # bootstrap still runs as an unprivileged user, still runs to completion,
+    # still gates the other two services - it just no longer discards the
+    # image's setup to get there.
+    #
+    # init.sh is baked into the image and made executable there, so a Windows
+    # checkout without the executable bit cannot break it.
+    command: ["bash", "/opt/airflow/init.sh"]
 
   # ===========================================================================
   # airflow-scheduler - parses DAGs, schedules and (under LocalExecutor) runs

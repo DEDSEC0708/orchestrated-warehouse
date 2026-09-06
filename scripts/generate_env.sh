@@ -87,28 +87,61 @@ echo "Generating secrets..."
 FERNET_KEY="$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 
+# The Airflow UI admin password. Generated rather than shipped, because a
+# default password in .env.example is a real credential the moment anyone
+# publishes port 8080 - and "change it later" is not a control.
+#
+# token_urlsafe would be shorter, but its alphabet includes '-' and '_' only:
+# this uses letters and digits so the value is safe to paste into a browser,
+# a shell, a URL and a .env file without quoting or escaping in any of them.
+ADMIN_PASSWORD="$(python3 -c '
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(24)))
+')"
+
 # On Linux, bind-mounted files are created with the container's UID. If that
 # does not match the host user, ./logs and ./data become root-owned and the
-# host user cannot delete them. Docker Desktop on macOS/Windows handles this
-# itself, so only adopt the host UID when it looks like a normal Linux user.
+# host user cannot delete them. Docker Desktop on macOS/Windows virtualises
+# ownership instead, so there the host UID buys nothing.
+#
+# Whatever lands here, the containers tolerate it: the Airflow image writes a
+# /etc/passwd entry for the running UID at start-up, and docker-compose.yml is
+# arranged so that always happens (ADR-017). This choice is about file
+# ownership on the host, not about whether the stack can boot.
+#
+# `id -u` reports the UID of the shell running THIS script, which is not
+# necessarily the Docker host's Linux. Git Bash and Cygwin on Windows are the
+# clear case - they report a UID that means nothing to Docker Desktop - so
+# they are detected and skipped. WSL is deliberately NOT skipped: with the
+# Docker Desktop WSL backend, files under the WSL filesystem really are owned
+# by that UID.
 AIRFLOW_UID_VALUE="50000"
-if command -v id >/dev/null 2>&1; then
-    HOST_UID="$(id -u)"
-    case "${HOST_UID}" in
-        ''|*[!0-9]*) : ;;
-        *)
-            if [ "${HOST_UID}" -ge 1000 ] && [ "${HOST_UID}" -le 60000 ]; then
-                AIRFLOW_UID_VALUE="${HOST_UID}"
-            fi
-            ;;
-    esac
-fi
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*)
+        # Windows shell emulation. Keep the image default.
+        ;;
+    *)
+        if command -v id >/dev/null 2>&1; then
+            HOST_UID="$(id -u)"
+            case "${HOST_UID}" in
+                ''|*[!0-9]*) : ;;
+                *)
+                    if [ "${HOST_UID}" -ge 1000 ] && [ "${HOST_UID}" -le 60000 ]; then
+                        AIRFLOW_UID_VALUE="${HOST_UID}"
+                    fi
+                    ;;
+            esac
+        fi
+        ;;
+esac
 
 # Substitution is done in Python rather than sed: sed's in-place flag and
 # escaping rules differ between GNU, BSD and Git Bash, and the generated keys
 # contain characters (/ + =) that are special to sed.
 FERNET_KEY="${FERNET_KEY}" \
 SECRET_KEY="${SECRET_KEY}" \
+ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
 AIRFLOW_UID_VALUE="${AIRFLOW_UID_VALUE}" \
 EXAMPLE_FILE="${EXAMPLE_FILE}" \
 ENV_FILE="${ENV_FILE}" \
@@ -123,6 +156,8 @@ replacements = {
         f"AIRFLOW__CORE__FERNET_KEY={os.environ['FERNET_KEY']}",
     "AIRFLOW__WEBSERVER__SECRET_KEY=REPLACE_ME_GENERATED_LOCALLY":
         f"AIRFLOW__WEBSERVER__SECRET_KEY={os.environ['SECRET_KEY']}",
+    "AIRFLOW_ADMIN_PASSWORD=REPLACE_ME_GENERATED_LOCALLY":
+        f"AIRFLOW_ADMIN_PASSWORD={os.environ['ADMIN_PASSWORD']}",
     "AIRFLOW_UID=50000":
         f"AIRFLOW_UID={os.environ['AIRFLOW_UID_VALUE']}",
 }
@@ -148,7 +183,14 @@ chmod 600 "${ENV_FILE}" 2>/dev/null || true
 echo "Created ${ENV_FILE}"
 echo "  - Fernet key generated"
 echo "  - Webserver secret key generated"
+echo "  - Airflow admin password generated"
 echo "  - AIRFLOW_UID set to ${AIRFLOW_UID_VALUE}"
 echo
-echo "NEXT: review .env and change the placeholder passwords before use."
+# The password is NOT echoed. Printing it here would put a live credential in
+# terminal scrollback, in CI logs, and in any screenshot of this command.
+echo "Airflow UI sign-in:"
+echo "  username: admin"
+echo "  password: grep AIRFLOW_ADMIN_PASSWORD .env"
+echo
+echo "NEXT: review .env and change the placeholder DATABASE passwords before use."
 echo "      .env is git-ignored and must never be committed."
