@@ -36,8 +36,24 @@ CREATE TABLE IF NOT EXISTS audit.pipeline_run (
     CONSTRAINT ck_pipeline_run_triggered_by CHECK (
         triggered_by IN ('schedule', 'manual', 'backfill', 'dataset', 'test')
     ),
-    CONSTRAINT ck_pipeline_run_interval CHECK (data_interval_end_utc > data_interval_start_utc)
+    -- >= not >, because a DATASET-scheduled DAG has no interval to speak of.
+    -- Airflow gives such runs a point in time: data_interval_start equals
+    -- data_interval_end. Requiring a strictly positive interval encoded an
+    -- assumption that only holds for cron-scheduled DAGs, and it rejected
+    -- every run of volthive_build_warehouse with
+    --   CheckViolation: ... violates check constraint "ck_pipeline_run_interval"
+    -- An inverted interval is still refused, which is the part that was ever
+    -- protecting anything.
+    CONSTRAINT ck_pipeline_run_interval CHECK (data_interval_end_utc >= data_interval_start_utc)
 );
+
+-- Existing warehouses: CREATE TABLE IF NOT EXISTS above is a no-op once the
+-- table exists, so the relaxed constraint has to be applied explicitly. DROP
+-- IF EXISTS followed by ADD is idempotent as a pair, and `make db-init` is
+-- already the documented way to bring a database back in line with the repo.
+ALTER TABLE audit.pipeline_run DROP CONSTRAINT IF EXISTS ck_pipeline_run_interval;
+ALTER TABLE audit.pipeline_run ADD CONSTRAINT ck_pipeline_run_interval
+    CHECK (data_interval_end_utc >= data_interval_start_utc);
 
 COMMENT ON TABLE audit.pipeline_run IS
     'One row per DAG run. pipeline_run_id is the correlation ID stamped on every warehouse row as dw_run_id.';

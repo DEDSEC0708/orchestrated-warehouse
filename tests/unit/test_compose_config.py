@@ -13,6 +13,7 @@ change nobody reviews.
 
 from __future__ import annotations
 
+import base64
 import re
 import shutil
 import subprocess
@@ -475,11 +476,14 @@ def _parse_env(text: str) -> dict[str, str]:
 @pytest.fixture
 def scratch_repo(tmp_path):
     """A throwaway repo holding just what generate_env.sh needs."""
-    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "lib").mkdir(parents=True)
     shutil.copy(REPO_ROOT / ".env.example", tmp_path / ".env.example")
     target = tmp_path / "scripts" / "generate_env.sh"
     shutil.copy(REPO_ROOT / "scripts" / "generate_env.sh", target)
     target.chmod(0o755)
+    # The generator sources its randomness helpers; without them the scratch
+    # repo would exercise a script that cannot run.
+    shutil.copy(SECRETS_LIB, tmp_path / "scripts" / "lib" / "secrets.sh")
     return tmp_path
 
 
@@ -639,6 +643,501 @@ def test_sign_in_is_documented_for_a_fresh_clone() -> None:
     assert (
         "AIRFLOW_ADMIN_PASSWORD" in readme
     ), "README must tell a developer where the Airflow password lives."
+
+
+# --------------------------------------------------------------------------
+# Where the pipeline actually runs
+#
+# The project's dependencies live in exactly one place: the volthive/airflow
+# image, pinned by requirements.txt against Airflow's constraints file. The
+# warehouse-lifecycle targets used to call the HOST interpreter, which works
+# only on a machine that has separately pip-installed the same pins - so on
+# Windows `make run` died with ModuleNotFoundError: No module named 'structlog'
+# against a perfectly healthy stack.
+#
+# Developer TOOLING (ruff, mypy, pytest) is the opposite case: it needs the dev
+# dependencies, which are deliberately not in the runtime image. Those targets
+# must keep running on the host.
+# --------------------------------------------------------------------------
+
+MAKEFILE = REPO_ROOT / "Makefile"
+IN_STACK = REPO_ROOT / "scripts" / "in-stack.sh"
+
+#: Targets that talk to the warehouse. These need the runtime dependencies.
+LIFECYCLE_TARGETS = {
+    "db-init",
+    "generate",
+    "run",
+    "analytics",
+    "dq-report",
+    "restate",
+    "backfill",
+    "rebuild-dims",
+}
+
+#: Targets that are developer tooling. These need the DEV dependencies, which
+#: are not in the runtime image, so they must stay on the host.
+HOST_TOOLING_TARGETS = {
+    "lint",
+    "format",
+    "typecheck",
+    "sqlfluff",
+    "test",
+    "test-unit",
+    "test-int",
+    "test-e2e",
+    "check",
+}
+
+
+def _make_recipes() -> dict[str, list[str]]:
+    """Parse `target:` / tab-indented recipe lines out of the Makefile."""
+    recipes: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in MAKEFILE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("\t"):
+            if current:
+                recipes[current].append(line.lstrip("\t"))
+            continue
+        match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*):", line)
+        current = match.group(1) if match else None
+        if current:
+            recipes.setdefault(current, [])
+    return recipes
+
+
+def test_scripts_are_mounted_into_the_airflow_image(services: dict[str, Any]) -> None:
+    """The entry points must exist inside the container that can run them."""
+    for name, spec in _airflow_services(services).items():
+        mounts = [str(v) for v in spec["volumes"]]
+        assert any("./scripts:/opt/airflow/scripts" in m for m in mounts), (
+            f"{name} does not mount ./scripts, so `docker compose run "
+            f"{name} python scripts/...` cannot find the script"
+        )
+        assert any(
+            "./scripts:/opt/airflow/scripts:ro" in m for m in mounts
+        ), "scripts/ must be mounted read-only - it is an input"
+
+
+@pytest.mark.parametrize("target", sorted(LIFECYCLE_TARGETS))
+def test_lifecycle_targets_run_in_the_container(target: str) -> None:
+    """A bare `python`/`bash` here assumes host dependencies that do not exist."""
+    recipe = _make_recipes()[target]
+    assert recipe, f"target {target} has no recipe"
+    for line in recipe:
+        assert line.startswith("$(IN_STACK)"), (
+            f"'{target}' runs '{line}' directly. The project's dependencies are "
+            "only in the Airflow image; route it through scripts/in-stack.sh."
+        )
+
+
+@pytest.mark.parametrize("target", sorted(HOST_TOOLING_TARGETS))
+def test_developer_tooling_stays_on_the_host(target: str) -> None:
+    """ruff, mypy and pytest are dev dependencies, absent from the runtime image."""
+    for line in _make_recipes()[target]:
+        assert "IN_STACK" not in line, (
+            f"'{target}' was routed into the container, which has no dev "
+            "dependencies. Only warehouse-lifecycle targets belong there."
+        )
+
+
+def test_only_the_generator_gets_source_write_access() -> None:
+    """cms_owner is the identity the pipeline is deliberately denied.
+
+    The generator impersonates the source system's operator and must write to
+    `cms`; everything else must not be able to. Granting it per invocation
+    keeps "the pipeline cannot corrupt its source" enforced by PostgreSQL
+    rather than by convention.
+    """
+    recipes = _make_recipes()
+    for target in LIFECYCLE_TARGETS:
+        uses_flag = any("--source-writer" in line for line in recipes[target])
+        assert uses_flag == (target == "generate"), (
+            f"'{target}' should {'' if target == 'generate' else 'not '}"
+            "request the cms_owner credential"
+        )
+
+
+def test_cms_owner_is_never_in_the_shared_airflow_environment(
+    services: dict[str, Any],
+) -> None:
+    """The long-running services must never hold source write access."""
+    for name, spec in _airflow_services(services).items():
+        env = spec["environment"]
+        assert "CMS_OWNER_PASSWORD" not in env, (
+            f"{name} carries the source-owner credential; a bug in a DAG could "
+            "then write to the database the pipeline is supposed to only read"
+        )
+
+
+def test_in_stack_forwards_arguments_verbatim() -> None:
+    """`--from` / `--to` and every other documented flag must survive intact."""
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash not available")
+    body = IN_STACK.read_text(encoding="utf-8")
+    assert (
+        'exec docker compose run --rm --no-deps -T "${EXTRA_ENV[@]}" airflow-scheduler "$@"' in body
+    ), 'in-stack.sh must forward "$@" unmodified to a fresh, dependency-free ' "container"
+    # `run --rm`, not `exec`: a backfill must not die when the scheduler
+    # restarts, and a report must not start services as a side effect.
+    # Comments are stripped first - the header explains why `exec` is wrong,
+    # and saying so must not trip the check that enforces it.
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    assert "compose exec" not in code
+
+
+def test_in_stack_never_puts_a_credential_in_argv() -> None:
+    """`-e NAME` takes the value from the environment; `-e NAME=value` shows it in ps."""
+    code = "\n".join(
+        line
+        for line in IN_STACK.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert re.search(r"-e\s+CMS_OWNER_PASSWORD(?!=)", code)
+    assert "CMS_OWNER_PASSWORD=" not in code.replace('CMS_OWNER_PASSWORD="', "ASSIGN")
+
+
+def test_ci_does_not_depend_on_the_makefile() -> None:
+    """This is the invariant that makes the change safe for CI.
+
+    CI runs the same scripts directly against a PostgreSQL service container
+    with its own pip-installed dependencies. If it ever started calling `make`,
+    routing those targets through Docker would break the pipeline.
+    """
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    offenders = [
+        line.strip()
+        for line in workflow.splitlines()
+        if re.search(r"^\s*(run:\s*)?make\s+[a-z]", line)
+    ]
+    assert not offenders, (
+        f"CI now invokes make: {offenders}. The warehouse-lifecycle targets run "
+        "inside Docker, which a CI service container cannot provide."
+    )
+
+
+# --------------------------------------------------------------------------
+# Credential rotation
+#
+# The PostgreSQL roles are created once, by docker/postgres/init/01_create_roles.sh,
+# on the first boot of an empty pgdata volume. After that .env is only what the
+# CLIENTS send - rewriting a password there without ALTERing the role in the
+# running server breaks every connection in the stack.
+# --------------------------------------------------------------------------
+
+ROTATE_SCRIPT = REPO_ROOT / "scripts" / "rotate_credentials.sh"
+LOGIN_CHECK_SCRIPT = REPO_ROOT / "scripts" / "check_airflow_login.sh"
+
+#: Every credential the rotation must replace. Adding one to .env without
+#: adding it here means it silently keeps its shipped value forever.
+ROTATABLE = {
+    "POSTGRES_PASSWORD",
+    "WH_ETL_PASSWORD",
+    "CMS_OWNER_PASSWORD",
+    "CMS_READER_PASSWORD",
+    "WH_ANALYST_PASSWORD",
+    "AIRFLOW_DB_PASSWORD",
+    "AIRFLOW_ADMIN_PASSWORD",
+    "AIRFLOW__WEBSERVER__SECRET_KEY",
+    "AIRFLOW__CORE__FERNET_KEY",
+}
+
+
+def test_rotation_covers_every_credential_in_the_example() -> None:
+    """A password the rotation forgets is one that keeps its published value."""
+    example = _parse_env((REPO_ROOT / ".env.example").read_text(encoding="utf-8"))
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+
+    secretish = {
+        key
+        for key in example
+        if key.endswith(("_PASSWORD", "SECRET_KEY", "FERNET_KEY"))
+        # The partner API token addresses a local mock with no auth behind it.
+        and "PARTNER" not in key
+    }
+    uncovered = sorted(key for key in secretish if key not in body)
+    assert not uncovered, f"rotate_credentials.sh never rotates: {uncovered}"
+    assert secretish == ROTATABLE, f"credential set drifted: {secretish ^ ROTATABLE}"
+
+
+def test_rotation_alters_roles_before_replacing_the_env_file() -> None:
+    """Ordering is the safety property.
+
+    ALTER first, authenticating with the credential still live in the running
+    container; move .env only once that succeeded. Reverse the two and a failed
+    ALTER leaves .env pointing at passwords the server never accepted.
+    """
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    alter_at = body.index("ALTER ROLE")
+    move_at = body.index('mv "${NEW_FILE}" "${ENV_FILE}"')
+    assert alter_at < move_at, "the .env swap must come after the role rotation"
+
+    # And a failed ALTER must abandon the new file rather than leave it lying
+    # around to be picked up by a later run.
+    assert 'rm -f "${NEW_FILE}"' in body
+
+
+def test_rotation_never_writes_secrets_anywhere_but_the_env_file() -> None:
+    """No temp SQL file, and nothing secret in argv where `ps` would show it."""
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    # psql must receive the statements on stdin, not as -c/--command.
+    assert "psql" in code
+    assert (
+        "-c " not in code.split("ALTER ROLE")[0].split("psql")[-1][:80]
+    ), "the ALTER statements must be piped to psql, not passed as arguments"
+    # The superuser password is read inside the container from its own
+    # environment, so it is never interpolated by the host shell.
+    assert 'PGPASSWORD="$POSTGRES_PASSWORD"' in code
+
+
+@pytest.mark.parametrize("script", [ROTATE_SCRIPT, LOGIN_CHECK_SCRIPT])
+def test_credential_scripts_never_echo_a_secret(script: Path) -> None:
+    """These are run over someone's shoulder and pasted into issues."""
+    secret_markers = (
+        "AIRFLOW_ADMIN_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "WH_ETL_PASSWORD",
+        "FERNET_KEY",
+        "SECRET_KEY",
+    )
+    for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped.startswith(("echo", "print(")):
+            continue
+        for marker in secret_markers:
+            # Naming the variable is fine ("see AIRFLOW_ADMIN_PASSWORD in .env");
+            # expanding it is not.
+            assert (
+                f"${{{marker}" not in stripped and f"${marker}" not in stripped
+            ), f"{script.name}:{number} expands a secret into output: {stripped}"
+
+
+def test_rotation_backs_up_before_the_one_way_door() -> None:
+    """From just before the ALTER onward, BOTH value sets must exist on disk.
+
+    Backing up after the commit instead opens a window where the database
+    holds passwords that exist nowhere else - and the superuser password is
+    among them, so that state is not recoverable by any means.
+    """
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    backup_at = body.index('cp "${ENV_FILE}" "${BACKUP}"')
+    alter_at = body.index("ALTER ROLE")
+    assert backup_at < alter_at, "the backup must be taken before the ALTER"
+
+
+def test_rotation_recovers_from_failures_after_the_commit() -> None:
+    """A failure past the commit must explain itself, not exit silently.
+
+    `set -e` alone aborts with no output at all, leaving an operator with new
+    passwords in the database, a half-recreated stack and no idea what to do.
+    """
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    assert "trap on_exit EXIT" in body, "no failure handler is installed"
+
+    # Branches may be combined (`recreate|verify)`), so match the phase name
+    # inside a case pattern rather than insisting on its own arm.
+    handler = body.split("on_exit() {", 1)[1].split("trap on_exit EXIT", 1)[0]
+    patterns = re.findall(r"^\s*([a-z|]+)\)\s*$", handler, re.MULTILINE)
+    covered = {phase for pattern in patterns for phase in pattern.split("|")}
+    for phase in ("prepare", "committed", "recreate", "verify"):
+        assert phase in covered, f"the handler has no branch for the {phase} phase"
+
+    # Every phase the script actually sets must be one the handler handles.
+    assigned = set(re.findall(r'PHASE="([a-z]+)"', body)) - {"done"}
+    assert assigned <= covered, f"phases set but unhandled: {assigned - covered}"
+
+    # The committed branch must protect the only copy of the live credentials.
+    committed = body.split("committed)", 1)[1].split(";;", 1)[0]
+    assert "DO NOT DELETE" in committed
+    assert 'rm -f "${NEW_FILE}"' not in committed, (
+        "the post-commit branch must never delete .env.new - after the "
+        "transaction it is the only record of the passwords now in force"
+    )
+
+
+def test_rotation_never_auto_deletes_the_backup() -> None:
+    """The backup must outlive the run unless nothing was applied."""
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    # The only permitted removal is inside the prepare branch, where the backup
+    # is provably identical to the live file.
+    for line_number, line in enumerate(body.splitlines(), 1):
+        if 'rm -f "${BACKUP}"' in line:
+            preceding = "\n".join(body.splitlines()[: line_number - 1])
+            assert 'cmp -s "${BACKUP}" "${ENV_FILE}"' in preceding, (
+                f"line {line_number} deletes the backup without proving it is "
+                "identical to the current .env"
+            )
+    # And success must only ever SUGGEST deleting it.
+    assert "rm $(basename" in body, "the success path should tell the user how"
+    tail = body.split('PHASE="done"', 1)[1]
+    assert 'rm -f "${BACKUP}"' not in tail, "success must not delete the backup"
+
+
+def test_rotation_never_destroys_the_data_volume() -> None:
+    """Rotating a password must never cost the warehouse.
+
+    `docker compose down -v` and `make clean` both "work" and both delete
+    every row in the database to change a credential.
+    """
+    code = "\n".join(
+        line
+        for line in ROTATE_SCRIPT.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for forbidden in ("compose down", "--volumes", "volume rm", "make clean"):
+        assert forbidden not in code, f"rotation must never run '{forbidden}'"
+    assert "--force-recreate" in code, "containers must be replaced, not restarted"
+
+
+def test_rotation_verifies_before_reporting_success() -> None:
+    """Every credential must be proved against the running stack.
+
+    verify_stack.sh logs in as all six roles; check_airflow_login.sh proves the
+    admin password. A partial rotation cannot pass both, which is what makes
+    "cannot leave clients on stale credentials" a checked claim.
+    """
+    body = ROTATE_SCRIPT.read_text(encoding="utf-8")
+    verify_at = body.index("scripts/verify_stack.sh")
+    login_at = body.index("scripts/check_airflow_login.sh")
+    success_at = body.index("ROTATION COMPLETE AND VERIFIED")
+    assert verify_at < success_at and login_at < success_at
+
+    # The one-shot bootstrap is what reconciles the admin password, so a
+    # non-zero exit from it must stop the run rather than be assumed away.
+    assert "State.ExitCode" in body
+    assert 'init_exit}" != "0"' in body
+
+
+# --------------------------------------------------------------------------
+# Git Bash on Windows
+#
+# Windows ships an "App Execution Alias" at
+# %LOCALAPPDATA%\\Microsoft\\WindowsApps\\python3.exe: a zero-byte reparse point
+# that exists, sits on PATH, and is marked executable. `command -v python3`
+# therefore SUCCEEDS, and the interpreter then fails at the point of use with
+#
+#   Python was not found; run without arguments to install from the Microsoft
+#   Store, or disable this shortcut from Settings > Apps > ...
+#
+# Existence is not executability. The fix is not a better probe - it is not
+# needing the interpreter, since openssl and awk ship with Git for Windows.
+# --------------------------------------------------------------------------
+
+SECRETS_LIB = REPO_ROOT / "scripts" / "lib" / "secrets.sh"
+
+#: Host-side scripts a developer runs before/around the stack. These must work
+#: on a machine that has Docker and Git Bash and nothing else.
+HOST_SCRIPTS = (
+    REPO_ROOT / "scripts" / "generate_env.sh",
+    ROTATE_SCRIPT,
+    SECRETS_LIB,
+)
+
+
+@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=lambda p: p.name)
+def test_host_scripts_do_not_invoke_python(script: Path) -> None:
+    """A language runtime must not stand between a clone and a running stack.
+
+    Requiring one is bad enough on its own; on Windows it fails through the
+    Store alias, which passes every existence check and then refuses to run.
+    """
+    for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert not re.search(
+            r"\bpython3?\b\s", stripped
+        ), f"{script.name}:{number} invokes a host Python: {stripped}"
+
+
+def test_no_script_probes_for_a_command_without_running_it() -> None:
+    """`command -v python3` is exactly the check the Store alias defeats.
+
+    Comments are stripped first: secrets.sh quotes the broken probe verbatim to
+    explain why it is broken, and documenting a trap must not trip the test
+    that guards against it.
+    """
+    for script in HOST_SCRIPTS:
+        code = "\n".join(
+            line
+            for line in script.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "command -v python" not in code, (
+            f"{script.name} probes for python by existence, which the Windows "
+            "App Execution Alias satisfies without being able to run"
+        )
+
+
+def test_secret_helpers_use_only_git_bash_builtins() -> None:
+    """openssl and awk ship with Git for Windows; nothing else may be assumed."""
+    body = SECRETS_LIB.read_text(encoding="utf-8")
+    for helper in (
+        "require_entropy_source",
+        "random_alnum",
+        "random_hex",
+        "random_fernet_key",
+    ):
+        assert f"{helper}()" in body, f"scripts/lib/secrets.sh lacks {helper}"
+
+    # A weak fallback is worse than a hard failure: it produces a password that
+    # looks fine and is guessable.
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    for weak in ("$RANDOM", "date +%s", "$$"):
+        assert weak not in code, f"secrets.sh falls back to a weak source: {weak}"
+
+
+def test_generated_fernet_key_is_a_real_fernet_key() -> None:
+    """openssl replaces cryptography.fernet here, so prove they agree.
+
+    Fernet.generate_key() is urlsafe_b64encode(os.urandom(32)); the helper must
+    produce something the library itself accepts, not merely something that
+    looks like a key.
+    """
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is present everywhere this runs
+        pytest.skip("bash not available")
+
+    result = subprocess.run(  # noqa: S603 - fixed argv, absolute interpreter
+        [bash, "-c", f". {SECRETS_LIB}; random_fernet_key"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    key = result.stdout.strip()
+
+    pytest.importorskip("cryptography")
+    from cryptography.fernet import Fernet
+
+    fernet = Fernet(key.encode())  # raises on a malformed key
+    assert fernet.decrypt(fernet.encrypt(b"probe")) == b"probe"
+    assert len(base64.urlsafe_b64decode(key)) == 32
+    assert re.fullmatch(r"[A-Za-z0-9_-]+=*", key), "key must be URL-safe base64"
+
+
+def test_generated_password_is_alphanumeric_and_long_enough() -> None:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash not available")
+
+    result = subprocess.run(  # noqa: S603 - fixed argv, absolute interpreter
+        [bash, "-c", f". {SECRETS_LIB}; random_alnum 32; echo; random_alnum 32"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    first, second = result.stdout.strip().splitlines()
+    assert len(first) == 32 and first.isalnum()
+    assert first != second, "generator is not random between calls"
+
+
+def test_env_backups_are_git_ignored() -> None:
+    """Rotation keeps the previous .env, which is a live credential until deleted."""
+    ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".env.*" in ignore, ".gitignore must cover .env.backup.* files"
+    assert "!.env.example" in ignore, "the committed template must stay committed"
 
 
 # --------------------------------------------------------------------------

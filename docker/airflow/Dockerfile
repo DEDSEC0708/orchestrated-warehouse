@@ -52,7 +52,12 @@ COPY --chown=airflow:root src/ /opt/airflow/src/
 COPY --chown=airflow:root docker/airflow/init.sh /opt/airflow/init.sh
 RUN chmod +x /opt/airflow/init.sh
 
-ENV PYTHONPATH=/opt/airflow/src \
+# /opt/airflow/src makes `import volthive` work; /opt/airflow makes
+# `import dags.common...` work - the DAGs import their shared helpers as a
+# package rooted at the repository, and Airflow only puts the DAGs FOLDER on
+# sys.path, not its parent. docker-compose.yml sets the same value; this keeps
+# a bare `docker run` of the image behaving identically.
+ENV PYTHONPATH=/opt/airflow/src:/opt/airflow \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 

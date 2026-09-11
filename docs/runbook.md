@@ -460,6 +460,103 @@ warehouse to reset a password that one `make up` already resets.
 
 ---
 
+## Symptom: the local credentials need rotating
+
+Every password in `.env` starts life as the same visible placeholder. Replacing
+them is one command:
+
+```bash
+bash scripts/rotate_credentials.sh --dry-run   # names the keys, shows no values
+bash scripts/rotate_credentials.sh --yes
+```
+
+**Do not just edit `.env`.** The PostgreSQL roles are created by
+`docker/postgres/init/01_create_roles.sh`, which the postgres image runs exactly
+once — on the first boot of an empty `pgdata` volume. It never runs again while
+that volume survives, so after the first boot `.env` is not the source of truth
+for role passwords; it is only what the clients send. Rewrite it alone and every
+component starts presenting a credential the server no longer accepts:
+
+```
+FATAL:  password authentication failed for user "wh_etl"
+```
+
+The script exists because the fix is to `ALTER` the roles in the running server
+so they match the new file, in the same operation, before anything restarts.
+That keeps the warehouse and changes the credentials. `make clean` also "works"
+and destroys every row you have to change a password.
+
+Ordering is the safety property, and it is deliberate: the new file is built
+first but staged as `.env.new`; the roles are altered next, authenticating with
+the credential still live in the running container; and `.env` is only replaced
+once that transaction commits. A failure at any point leaves the stack exactly
+as it was. The previous file is kept as `.env.backup.<timestamp>` — git-ignored,
+and still a live credential until you delete it.
+
+Afterwards:
+
+```bash
+bash scripts/verify_stack.sh          # every role can do exactly what it should
+bash scripts/check_airflow_login.sh   # the UI accepts the new admin password
+make run                              # the pipeline still connects
+```
+
+**The Fernet key.** Rotating it is safe here only because this project stores
+nothing encrypted in the Airflow metadata database — connections are injected as
+`AIRFLOW_CONN_*` environment variables precisely so each password exists once.
+The script does not take that on trust: it counts rows in `connection` and
+`variable` first and refuses to rotate the key if either is non-empty, since a
+new key would make those rows permanently undecryptable. Use `--keep-fernet` to
+rotate everything else in that case.
+
+---
+
+## Symptom: `relation "audit.pipeline_run" does not exist`
+
+The warehouse schema has not been applied. Starting the stack creates the
+roles, the three databases and the extensions — it does **not** create the
+schema, deliberately: `docker/postgres/init/*.sh` is infrastructure bootstrap,
+`sql/ddl/**` is the schema, and they are separate concerns with separate
+failure modes (`docker/airflow/init.sh` says so at the point where the
+temptation to merge them is strongest).
+
+So `make up` leaves an empty `warehouse` database, and the first thing the
+pipeline does is insert into `audit.pipeline_run`.
+
+```bash
+make db-init      # apply the schema, seeds and data-quality rules
+```
+
+`make run` assumes both the schema **and** generated data already exist. From
+an empty database the one command that does everything is:
+
+```bash
+make run-clean    # db-init, generate, run
+```
+
+The pipeline now refuses to start in this state and says which schemas are
+missing and which command applies them, rather than failing fifteen frames deep
+inside the first INSERT. If you see the raw `UndefinedTable` error again,
+`require_initialised_warehouse` has been removed from `pipeline.open_run`.
+
+**A related symptom with the same cause:** `make run` succeeds as far as the
+data-quality gate and then reports
+
+```
+dq_gate_blocked  rules=["ROWCOUNT_ZERO_SESSION"]
+```
+
+That is the gate doing its job — the schema exists but nothing was ever
+generated, so there are no sessions to publish. Run `make generate` (or
+`make run-clean`), not `--skip-dq-gate`.
+
+`make db-init` is idempotent: every DDL statement is `CREATE ... IF NOT
+EXISTS`, and the data-quality rules are re-synced from `configs/dq_rules.yml`,
+so re-running it is a cheap way to bring an existing database back in line with
+the repository.
+
+---
+
 ## Things that are safe
 
 - Re-running any stage over any window.

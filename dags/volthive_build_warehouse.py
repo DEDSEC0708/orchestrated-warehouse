@@ -106,7 +106,7 @@ with DAG(
     with TaskGroup(group_id="staging") as staging_group:
 
         @task(task_id="rebuild_staging", **TRANSFORM_ARGS)
-        def rebuild_staging(run_id: str, **context) -> int:
+        def rebuild_staging(pipeline_run_id: str, **context) -> int:
             """Cast, conform, deduplicate, validate and split valid/invalid.
 
             One task rather than twelve. The steps share a restatement window
@@ -121,7 +121,7 @@ with DAG(
                 lookback_days=int(context["params"]["lookback_days"]),
             )
             stats = stage_all(
-                run_id=run_id, batch_lo=lo, batch_hi=hi, dag_id="volthive_build_warehouse"
+                run_id=pipeline_run_id, batch_lo=lo, batch_hi=hi, dag_id="volthive_build_warehouse"
             )
             return sum(s.rows_inserted for s in stats)
 
@@ -130,7 +130,7 @@ with DAG(
     with TaskGroup(group_id="dimensions") as dimension_group:
 
         @task(task_id="merge_dimensions", **TRANSFORM_ARGS)
-        def merge_dimensions(run_id: str, **context) -> int:
+        def merge_dimensions(pipeline_run_id: str, **context) -> int:
             """SCD2 merges, Type 1 loads, then inferred members.
 
             Each dimension merges in its OWN transaction. A crash mid-merge
@@ -147,7 +147,7 @@ with DAG(
                 lookback_days=int(context["params"]["lookback_days"]),
             )
             stats = transform_dimensions(
-                run_id=run_id,
+                run_id=pipeline_run_id,
                 batch_lo=lo,
                 batch_hi=hi,
                 dag_id="volthive_build_warehouse",
@@ -160,7 +160,7 @@ with DAG(
     with TaskGroup(group_id="facts") as fact_group:
 
         @task(task_id="load_facts", **TRANSFORM_ARGS)
-        def load_facts(run_id: str, **context) -> int:
+        def load_facts(pipeline_run_id: str, **context) -> int:
             """Point-in-time key resolution and delete-insert restatement.
 
             The three facts load in dependency order inside this task: the
@@ -172,14 +172,14 @@ with DAG(
                 lookback_days=int(context["params"]["lookback_days"]),
             )
             stats = transform_facts(
-                run_id=run_id, batch_lo=lo, batch_hi=hi, dag_id="volthive_build_warehouse"
+                run_id=pipeline_run_id, batch_lo=lo, batch_hi=hi, dag_id="volthive_build_warehouse"
             )
             return sum(s.rows_inserted for s in stats)
 
         loaded = load_facts("{{ ti.xcom_pull(task_ids='open_pipeline_run') }}")
 
     @task(task_id="dq_publish_gate", **TRANSFORM_ARGS)
-    def dq_publish_gate(run_id: str, **context) -> dict:
+    def dq_publish_gate(pipeline_run_id: str, **context) -> dict:
         """Run every dataset rule and BLOCK the mart on an error-severity fail.
 
         Raising is what stops the mart. Downstream tasks use the default
@@ -192,7 +192,7 @@ with DAG(
             lookback_days=int(context["params"]["lookback_days"]),
         )
         decision = run_dq_gate(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             batch_lo=lo,
             batch_hi=hi,
             skip_gate=bool(context["params"]["skip_dq_gate"]),
@@ -207,7 +207,7 @@ with DAG(
     with TaskGroup(group_id="mart") as mart_group:
 
         @task(task_id="rebuild_mart", **TRANSFORM_ARGS)
-        def rebuild_mart(run_id: str, **context) -> int:
+        def rebuild_mart(pipeline_run_id: str, **context) -> int:
             """Rebuild the aggregates in full. Trivially idempotent."""
             lo, hi = batch_window(
                 context["data_interval_start"],
@@ -215,14 +215,14 @@ with DAG(
                 lookback_days=int(context["params"]["lookback_days"]),
             )
             stats = transform_mart(
-                run_id=run_id, batch_lo=lo, batch_hi=hi, dag_id="volthive_build_warehouse"
+                run_id=pipeline_run_id, batch_lo=lo, batch_hi=hi, dag_id="volthive_build_warehouse"
             )
             return sum(s.rows_inserted for s in stats)
 
         marts = rebuild_mart("{{ ti.xcom_pull(task_ids='open_pipeline_run') }}")
 
     @task(task_id="close_pipeline_run", trigger_rule="all_done")
-    def close_pipeline_run(run_id: str, **context) -> None:
+    def close_pipeline_run(pipeline_run_id: str, **context) -> None:
         """Close the run out. Runs whatever happened upstream."""
         task_instance = context["task_instance"]
         failed = [
@@ -231,7 +231,7 @@ with DAG(
             if t.state == "failed" and t.task_id != task_instance.task_id
         ]
         close_run(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             dag_id="volthive_build_warehouse",
             status="FAILED" if failed else "SUCCESS",
             error_summary=f"failed tasks: {', '.join(failed)}" if failed else None,

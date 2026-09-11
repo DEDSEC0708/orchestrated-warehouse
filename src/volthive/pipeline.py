@@ -28,6 +28,7 @@ from typing import Any
 
 from volthive.audit import LoadStat, close_pipeline_run, open_pipeline_run, record_task_run
 from volthive.db.connection import fetch_value, transaction, warehouse_connection
+from volthive.db.preflight import require_initialised_warehouse
 from volthive.dq.engine import GateDecision, evaluate_gate, run_dataset_checks
 from volthive.ingest.cms import CMS_ENTITIES, ingest_cms_entity
 from volthive.ingest.files import ingest_file_source, ingest_seed_file
@@ -99,6 +100,12 @@ def open_run(
     visible in the type signature.
     """
     with warehouse_connection(application_name=f"{dag_id}.open_run") as conn, transaction(conn):
+        # Every run starts here - the scripts and all three DAGs - which makes
+        # this the one place worth asserting that the warehouse actually
+        # exists. Without it the next statement fails with
+        # `relation "audit.pipeline_run" does not exist`, which is true but
+        # tells the reader nothing about the missing `make db-init`.
+        require_initialised_warehouse(conn)
         run_id = open_pipeline_run(
             conn,
             dag_id=dag_id,

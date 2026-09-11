@@ -23,7 +23,15 @@
 #   script replaces it on each developer's machine.
 #
 # REQUIREMENTS
-#   python3 with the `cryptography` package (installed as an Airflow dependency).
+#   openssl and awk. Both ship with Git for Windows and with every Linux
+#   distribution, so there is nothing to install.
+#
+#   This deliberately does NOT need Python. It used to, for
+#   cryptography.fernet.Fernet.generate_key() - and on Windows that made the
+#   documented first command of this project fail with "Python was not found;
+#   run without arguments to install from the Microsoft Store", because the
+#   python3 on PATH is usually the Store's alias stub. A Fernet key is just 32
+#   random bytes in URL-safe base64, which openssl produces directly.
 #
 # WINDOWS
 #   Run from Git Bash or WSL:  bash scripts/generate_env.sh
@@ -77,15 +85,16 @@ if [ -f "${ENV_FILE}" ] && [ "${FORCE}" != "yes" ]; then
     fi
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "ERROR: python3 not found on PATH." >&2
-    exit 1
-fi
+command -v awk >/dev/null 2>&1 || { echo "ERROR: awk not found on PATH." >&2; exit 1; }
+
+# shellcheck source=scripts/lib/secrets.sh
+. "${REPO_ROOT}/scripts/lib/secrets.sh"
+require_entropy_source || exit 1
 
 echo "Generating secrets..."
 
-FERNET_KEY="$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
-SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+FERNET_KEY="$(random_fernet_key)"
+SECRET_KEY="$(random_hex 32)"
 
 # The Airflow UI admin password. Generated rather than shipped, because a
 # default password in .env.example is a real credential the moment anyone
@@ -94,11 +103,7 @@ SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 # token_urlsafe would be shorter, but its alphabet includes '-' and '_' only:
 # this uses letters and digits so the value is safe to paste into a browser,
 # a shell, a URL and a .env file without quoting or escaping in any of them.
-ADMIN_PASSWORD="$(python3 -c '
-import secrets, string
-alphabet = string.ascii_letters + string.digits
-print("".join(secrets.choice(alphabet) for _ in range(24)))
-')"
+ADMIN_PASSWORD="$(random_alnum 24)"
 
 # On Linux, bind-mounted files are created with the container's UID. If that
 # does not match the host user, ./logs and ./data become root-owned and the
@@ -136,47 +141,44 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
         ;;
 esac
 
-# Substitution is done in Python rather than sed: sed's in-place flag and
-# escaping rules differ between GNU, BSD and Git Bash, and the generated keys
-# contain characters (/ + =) that are special to sed.
-FERNET_KEY="${FERNET_KEY}" \
-SECRET_KEY="${SECRET_KEY}" \
-ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
-AIRFLOW_UID_VALUE="${AIRFLOW_UID_VALUE}" \
-EXAMPLE_FILE="${EXAMPLE_FILE}" \
-ENV_FILE="${ENV_FILE}" \
-python3 - <<'PYTHON'
-import os
-from pathlib import Path
-
-example = Path(os.environ["EXAMPLE_FILE"]).read_text(encoding="utf-8")
-
-replacements = {
-    "AIRFLOW__CORE__FERNET_KEY=REPLACE_ME_GENERATED_LOCALLY":
-        f"AIRFLOW__CORE__FERNET_KEY={os.environ['FERNET_KEY']}",
-    "AIRFLOW__WEBSERVER__SECRET_KEY=REPLACE_ME_GENERATED_LOCALLY":
-        f"AIRFLOW__WEBSERVER__SECRET_KEY={os.environ['SECRET_KEY']}",
-    "AIRFLOW_ADMIN_PASSWORD=REPLACE_ME_GENERATED_LOCALLY":
-        f"AIRFLOW_ADMIN_PASSWORD={os.environ['ADMIN_PASSWORD']}",
-    "AIRFLOW_UID=50000":
-        f"AIRFLOW_UID={os.environ['AIRFLOW_UID_VALUE']}",
+# Substitution is done with awk rather than sed: sed's in-place flag and
+# escaping rules differ between GNU, BSD and Git Bash, and generated keys can
+# contain characters (/ + =) that are special to sed. awk does a literal
+# assignment, so no value is ever re-parsed.
+#
+# Values travel in the environment, not in argv, because argv is world-readable
+# through `ps`.
+GEN_FERNET_KEY="${FERNET_KEY}" \
+GEN_SECRET_KEY="${SECRET_KEY}" \
+GEN_ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
+GEN_AIRFLOW_UID="${AIRFLOW_UID_VALUE}" \
+awk '
+{
+    if ($0 == "AIRFLOW__CORE__FERNET_KEY=REPLACE_ME_GENERATED_LOCALLY") {
+        print "AIRFLOW__CORE__FERNET_KEY=" ENVIRON["GEN_FERNET_KEY"]; seen["fernet"] = 1; next
+    }
+    if ($0 == "AIRFLOW__WEBSERVER__SECRET_KEY=REPLACE_ME_GENERATED_LOCALLY") {
+        print "AIRFLOW__WEBSERVER__SECRET_KEY=" ENVIRON["GEN_SECRET_KEY"]; seen["secret"] = 1; next
+    }
+    if ($0 == "AIRFLOW_ADMIN_PASSWORD=REPLACE_ME_GENERATED_LOCALLY") {
+        print "AIRFLOW_ADMIN_PASSWORD=" ENVIRON["GEN_ADMIN_PASSWORD"]; seen["admin"] = 1; next
+    }
+    if ($0 == "AIRFLOW_UID=50000") {
+        print "AIRFLOW_UID=" ENVIRON["GEN_AIRFLOW_UID"]; seen["uid"] = 1; next
+    }
+    print $0
 }
-
-missing = [key for key in replacements if key not in example]
-if missing:
-    raise SystemExit(
-        ".env.example does not contain the expected placeholder lines:\n  "
-        + "\n  ".join(missing)
-    )
-
-content = example
-for placeholder, value in replacements.items():
-    content = content.replace(placeholder, value)
-
-# newline="\n": always write LF, even when this runs on Windows, because the
-# file is read inside a Linux container.
-Path(os.environ["ENV_FILE"]).write_text(content, encoding="utf-8", newline="\n")
-PYTHON
+END {
+    split("fernet,secret,admin,uid", need, ",")
+    for (i = 1; i <= 4; i++) {
+        if (!(need[i] in seen)) {
+            print ".env.example is missing the " need[i] " placeholder line" > "/dev/stderr"
+            bad = 1
+        }
+    }
+    if (bad) exit 1
+}
+' "${EXAMPLE_FILE}" > "${ENV_FILE}"
 
 chmod 600 "${ENV_FILE}" 2>/dev/null || true
 

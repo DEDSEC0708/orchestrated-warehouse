@@ -83,7 +83,7 @@ with DAG(
     )
 
     @task(task_id="ingest_session_files", **INGESTION_ARGS)
-    def ingest_session_files(run_id: str, **context) -> dict[str, int]:
+    def ingest_session_files(pipeline_run_id: str, **context) -> dict[str, int]:
         """Load unprocessed files in the three-day lookback window.
 
         The lookback exists because a ``dt=`` partition is occasionally
@@ -92,7 +92,7 @@ with DAG(
         hash and a rewritten file is reprocessed automatically.
         """
         return ingest_sessions_files(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             data_interval_start=context["data_interval_start"],
             data_interval_end=context["data_interval_end"],
             sources=context["params"].get("sources"),
@@ -103,7 +103,7 @@ with DAG(
         task_id="ingest_partner_cdrs",
         **{**INGESTION_ARGS, "execution_timeout": timedelta(minutes=10)},
     )
-    def ingest_partner_cdrs_task(run_id: str, **context) -> int:
+    def ingest_partner_cdrs_task(pipeline_run_id: str, **context) -> int:
         """Page through the roaming partner's cursor window.
 
         DELIBERATELY NOT DOWNSTREAM OF THE SENSOR. A missing OCPP file must not
@@ -111,7 +111,7 @@ with DAG(
         arrives over an API that knows nothing about VoltHive's file drops.
         """
         return ingest_partner(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             data_interval_start=context["data_interval_start"],
             data_interval_end=context["data_interval_end"],
             dag_id="volthive_ingest_sessions",
@@ -129,7 +129,7 @@ with DAG(
         return {"files": file_counts or {}, "partner_rows": partner_rows}
 
     @task(task_id="close_pipeline_run", trigger_rule="all_done")
-    def close_pipeline_run(run_id: str, **context) -> None:
+    def close_pipeline_run(pipeline_run_id: str, **context) -> None:
         task_instance = context["task_instance"]
         failed = [
             t.task_id
@@ -137,7 +137,7 @@ with DAG(
             if t.state == "failed" and t.task_id != task_instance.task_id
         ]
         close_run(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             dag_id="volthive_ingest_sessions",
             status="FAILED" if failed else "SUCCESS",
             error_summary=f"failed tasks: {', '.join(failed)}" if failed else None,

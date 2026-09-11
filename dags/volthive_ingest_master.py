@@ -52,7 +52,7 @@ with DAG(
         )
 
     @task(task_id="ingest_cms_entities", **INGESTION_ARGS)
-    def ingest_cms_entities(run_id: str, **context) -> dict[str, int]:
+    def ingest_cms_entities(pipeline_run_id: str, **context) -> dict[str, int]:
         """Extract all five CMS entities on a bounded updated_at window.
 
         The upper bound is the DATA INTERVAL END, never now(). With now(), the
@@ -61,14 +61,14 @@ with DAG(
         pull current data into a historical partition.
         """
         return ingest_all_cms(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             data_interval_start=context["data_interval_start"],
             data_interval_end=context["data_interval_end"],
             dag_id="volthive_ingest_master",
         )
 
     @task(task_id="ingest_grid_tariff_seed", **INGESTION_ARGS)
-    def ingest_grid_tariff_seed(run_id: str) -> int:
+    def ingest_grid_tariff_seed(pipeline_run_id: str) -> int:
         """Reload source S5 in full - sixty rows, truncate and replace.
 
         Deliberately NOT incremental. Slowly-changing reference data this small
@@ -76,7 +76,7 @@ with DAG(
         not incremental is what makes "incremental everywhere" visibly a choice
         rather than a reflex.
         """
-        return ingest_seed(run_id=run_id, dag_id="volthive_ingest_master")
+        return ingest_seed(run_id=pipeline_run_id, dag_id="volthive_ingest_master")
 
     @task(task_id="publish_raw_cms_master", outlets=[RAW_CMS_MASTER])
     def publish_raw_cms_master(cms_counts: dict[str, int], seed_rows: int) -> dict[str, int]:
@@ -88,7 +88,7 @@ with DAG(
         return {**cms_counts, "grid_tariff_slab": seed_rows}
 
     @task(task_id="close_pipeline_run", trigger_rule="all_done")
-    def close_pipeline_run(run_id: str, **context) -> None:
+    def close_pipeline_run(pipeline_run_id: str, **context) -> None:
         """Close the run, whatever happened.
 
         trigger_rule='all_done' so a failed run is still closed out. A run left
@@ -102,7 +102,7 @@ with DAG(
             if t.state == "failed" and t.task_id != task_instance.task_id
         ]
         close_run(
-            run_id=run_id,
+            run_id=pipeline_run_id,
             dag_id="volthive_ingest_master",
             status="FAILED" if failed else "SUCCESS",
             error_summary=f"failed tasks: {', '.join(failed)}" if failed else None,

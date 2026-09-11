@@ -40,12 +40,15 @@ from typing import Any
 
 import psycopg
 
+from volthive.exceptions import ContractError
 from volthive.logging_setup import get_logger
 
 __all__ = [
+    "TRIGGERED_BY_DOMAIN",
     "LoadStat",
     "close_pipeline_run",
     "current_git_sha",
+    "normalise_triggered_by",
     "open_pipeline_run",
     "record_task_run",
     "write_load_stat",
@@ -129,6 +132,65 @@ class LoadStat:
         )
 
 
+#: The closed domain of ``audit.pipeline_run.triggered_by``, enforced by
+#: ``ck_pipeline_run_triggered_by`` and sized by its VARCHAR(16) column.
+TRIGGERED_BY_DOMAIN: frozenset[str] = frozenset(
+    {"schedule", "manual", "backfill", "dataset", "test"}
+)
+
+#: Airflow's ``DagRun.run_type`` vocabulary is NOT this project's. Airflow says
+#: "scheduled" where the warehouse says "schedule", and "dataset_triggered"
+#: where it says "dataset" - which is also 17 characters against a VARCHAR(16).
+#:
+#: Passing run_type through verbatim therefore failed every DAG that opens a
+#: run, in three different ways depending on how the run started:
+#:
+#:   scheduled          -> CheckViolation on ck_pipeline_run_triggered_by
+#:   dataset_triggered  -> StringDataRightTruncation, before the CHECK is reached
+#:   manual             -> fine
+#:
+#: The CLI never hit any of it because run_pipeline.py passes the literal
+#: "manual". Translating at this boundary keeps the stored vocabulary stable -
+#: the alternative, widening the column and the CHECK to hold Airflow's words,
+#: would migrate every existing warehouse to record a scheduler's spelling.
+_AIRFLOW_RUN_TYPES: dict[str, str] = {
+    "scheduled": "schedule",
+    "dataset_triggered": "dataset",
+    # Airflow 3 renames datasets to assets; mapping it now costs nothing and
+    # means the rename is not a production incident.
+    "asset_triggered": "dataset",
+    "manual": "manual",
+    "backfill": "backfill",
+}
+
+
+def normalise_triggered_by(value: str | None) -> str:
+    """Translate an Airflow ``run_type`` into the audit table's domain.
+
+    Raises :class:`ContractError` on anything unrecognised rather than letting
+    it reach the INSERT. A new Airflow run type is exactly the "shape of the
+    world changed" case: failing here names the value, where failing in the
+    database names a constraint. ``tests/unit/test_audit_triggered_by.py``
+    asserts every run type Airflow currently defines maps, so an upgrade that
+    adds one breaks a test rather than a pipeline.
+    """
+    if value is None or not str(value).strip():
+        return "schedule"
+
+    raw = str(value).strip()
+    mapped = _AIRFLOW_RUN_TYPES.get(raw, raw)
+    if mapped not in TRIGGERED_BY_DOMAIN:
+        raise ContractError(
+            f"unrecognised trigger type {raw!r}; audit.pipeline_run.triggered_by "
+            f"accepts {sorted(TRIGGERED_BY_DOMAIN)}. Add a mapping in "
+            f"volthive.audit._AIRFLOW_RUN_TYPES.",
+            entity="audit.pipeline_run.triggered_by",
+            expected=sorted(TRIGGERED_BY_DOMAIN),
+            actual=raw,
+        )
+    return mapped
+
+
 def open_pipeline_run(
     conn: psycopg.Connection,
     *,
@@ -147,6 +209,7 @@ def open_pipeline_run(
     fact row you can therefore reach the run, the task, the source file and the
     git commit that produced it.
     """
+    triggered_by = normalise_triggered_by(triggered_by)
     run_id = pipeline_run_id or str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(

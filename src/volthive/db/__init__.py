@@ -25,6 +25,7 @@ from volthive.db.connection import (
     warehouse_connection,
 )
 from volthive.db.params import extract_param_names, translate_named_params
+from volthive.db.preflight import REQUIRED_SCHEMAS, require_initialised_warehouse
 from volthive.db.sqlfiles import (
     load_sql,
     run_sql,
@@ -37,10 +38,12 @@ from volthive.db.sqlfiles import (
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "DEFAULT_STATEMENT_TIMEOUT_MS",
+    "REQUIRED_SCHEMAS",
     "cms_connection",
     "connect",
     "copy_rows",
     "extract_param_names",
+    "require_initialised_warehouse",
     "fetch_all",
     "fetch_one",
     "fetch_value",

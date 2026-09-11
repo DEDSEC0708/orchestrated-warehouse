@@ -461,8 +461,16 @@ orchestrated-warehouse/
 
 ## Getting started
 
-**Prerequisites:** Docker with Compose v2, GNU Make, and Python 3.11 if you
-want to run the tooling outside the container. On Windows, run from Git Bash.
+**Prerequisites:** Docker with Compose v2 and GNU Make. On Windows, run from
+Git Bash.
+
+Python 3.11 is needed only to run the test suite and the pipeline scripts
+**outside** the container. The setup and credential scripts deliberately do not
+need it — they use `openssl` and `awk`, both of which ship with Git for Windows.
+That matters on Windows specifically: the `python3` on `PATH` there is usually
+the Microsoft Store's App Execution Alias, a stub that exists, satisfies
+`command -v`, and then refuses to run — so a script that merely checks for
+Python passes its own guard and fails later, mid-operation.
 
 ```bash
 git clone <this repository> && cd orchestrated-warehouse
@@ -505,7 +513,23 @@ and "change it later" is not a control. `docker/airflow/init.sh` refuses to
 start while the placeholder is still in place, so the stack cannot come up on a
 credential that is public in this repository.
 
-To rotate it, edit `AIRFLOW_ADMIN_PASSWORD` in `.env` and run `make up`. The
+To replace **every** local credential at once — the six PostgreSQL role
+passwords, the admin password, the Fernet key and the session key:
+
+```bash
+bash scripts/rotate_credentials.sh --dry-run
+bash scripts/rotate_credentials.sh --yes
+```
+
+Editing the database passwords in `.env` by hand does **not** work: the roles
+are created once, on the first boot of an empty `pgdata` volume, so the file is
+only what the clients send afterwards. The script `ALTER`s the roles in the
+running server to match, in the same operation, which is what lets the
+credentials change without destroying the warehouse. See the runbook entry
+"the local credentials need rotating".
+
+To rotate just the UI password, edit `AIRFLOW_ADMIN_PASSWORD` in `.env` and run
+`make up`. The
 bootstrap **reconciles** the account to whatever `.env` says on every run
 rather than only creating it when absent, so the file stays authoritative
 instead of being silently overruled by the metadata database after first boot.
@@ -547,6 +571,29 @@ make dq-report                    # quality scorecard for the latest run
 
 Or through Airflow: open <http://localhost:8080>, unpause the DAGs, and the
 ingestion DAGs will trigger `volthive_build_warehouse` through Datasets.
+
+**These run inside the Airflow image, not on your machine.** That image is the
+only place the pipeline's dependencies are installed — pinned once, in
+`requirements.txt`, against Airflow's constraints file. Installing them on the
+host as well would mean maintaining the same pins twice, so `scripts/in-stack.sh`
+runs each command in a throwaway container built from that image, with `./src`,
+`./sql`, `./configs`, `./scripts` and `./data` mounted and every value from
+`.env` in its environment. Nothing to install, and the credentials the pipeline
+uses are always the ones currently in `.env`.
+
+The consequence worth knowing: `make up` must have run first, and editing a
+file under `src/` takes effect immediately, because it is a mount rather than a
+copy. If you would rather use your own interpreter — after `make install-dev`,
+against a PostgreSQL of your choosing, which is the shape CI uses — set
+`VOLTHIVE_EXEC=host`:
+
+```bash
+VOLTHIVE_EXEC=host make run
+```
+
+Developer tooling (`make lint`, `make typecheck`, `make test`) deliberately
+stays on the host: those need the *dev* dependencies, which are not in the
+runtime image.
 
 Generator profiles:
 

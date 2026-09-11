@@ -165,18 +165,40 @@ verify:
 	bash scripts/verify_stack.sh
 
 # --- Warehouse lifecycle ---------------------------------------------------
-# These talk to whatever PostgreSQL the environment points at - the compose
-# stack by default, a CI service container in the pipeline. They are the same
-# commands CI runs, so a green pipeline and a working laptop mean the same
-# thing.
+# These run INSIDE the Airflow image, via scripts/in-stack.sh.
+#
+# That image is the only place the project's dependencies are installed -
+# structlog, psycopg, pydantic, the pinned Airflow set - built from
+# requirements.txt against Airflow's constraints file. Installing them on the
+# host as well would mean pinning the same versions twice, which is how two
+# environments drift apart and how "works on my machine" starts.
+#
+# So the host owns the source and Docker owns the runtime. The container gets
+# ./scripts, ./src, ./sql, ./configs and ./data mounted and every value from
+# .env in its environment, so these commands see exactly what the scheduler
+# sees - including the current database credentials, without a second copy of
+# them anywhere.
+#
+# CI does not use these targets. It calls the same scripts directly against a
+# PostgreSQL service container with its own pip-installed dependencies, which
+# is why the scripts themselves contain no container assumptions and why this
+# change cannot affect the pipeline.
+#
+# VOLTHIVE_EXEC=host runs them with your own interpreter instead, for anyone
+# who has run `make install-dev`.
 
+IN_STACK := bash scripts/in-stack.sh
 PROFILE ?= tiny
 
 db-init:
-	python scripts/apply_schema.py
+	$(IN_STACK) python scripts/apply_schema.py
 
+# --source-writer: the generator impersonates the SOURCE system's operator, so
+# it needs cms_owner - the one identity the pipeline itself is denied. Granted
+# per invocation rather than in x-airflow-common, so the scheduler and
+# webserver never hold write access to the database they read from.
 generate:
-	python scripts/generate_data.py --profile $(PROFILE)
+	$(IN_STACK) --source-writer python scripts/generate_data.py --profile $(PROFILE)
 
 # FROM and TO default to the tiny profile's window so `make run` works
 # immediately after `make generate`. Override for any other range.
@@ -184,27 +206,27 @@ FROM ?= 2026-06-01
 TO   ?= 2026-06-07
 
 run:
-	python scripts/run_pipeline.py --from $(FROM) --to $(TO)
+	$(IN_STACK) python scripts/run_pipeline.py --from $(FROM) --to $(TO)
 
 run-clean: db-init generate run
 
 analytics:
-	bash scripts/run_analytics.sh
+	$(IN_STACK) bash scripts/run_analytics.sh
 
 dq-report:
-	python scripts/dq_report.py
+	$(IN_STACK) python scripts/dq_report.py
 
 # Replays a window from raw without contacting any source. See the header of
 # scripts/restate.py for why that is the payoff of keeping raw immutable.
 restate:
-	python scripts/restate.py --from $(FROM) --to $(TO)
+	$(IN_STACK) python scripts/restate.py --from $(FROM) --to $(TO)
 
 # Chunked replay. CHUNK_DAYS controls how often it commits, and therefore how
 # far a crash rewinds.
 CHUNK_DAYS ?= 30
 
 backfill:
-	bash scripts/backfill.sh --from $(FROM) --to $(TO) --chunk-days $(CHUNK_DAYS)
+	$(IN_STACK) bash scripts/backfill.sh --from $(FROM) --to $(TO) --chunk-days $(CHUNK_DAYS)
 
 # Destructive. Previews unless YES=1, because rebuilding dimension history
 # reissues every surrogate key and rebuilds every fact.
@@ -212,4 +234,4 @@ DIM ?= all
 YES ?= 0
 
 rebuild-dims:
-	python scripts/rebuild_dimension_history.py --dim $(DIM) $(if $(filter 1,$(YES)),--yes,--dry-run)
+	$(IN_STACK) python scripts/rebuild_dimension_history.py --dim $(DIM) $(if $(filter 1,$(YES)),--yes,--dry-run)

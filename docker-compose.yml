@@ -126,13 +126,40 @@ x-airflow-common: &airflow-common
     VOLTHIVE_PARTNER_MODE: ${VOLTHIVE_PARTNER_MODE:-file}
     VOLTHIVE_GENERATOR_SEED: ${VOLTHIVE_GENERATOR_SEED:-42}
     VOLTHIVE_GENERATOR_PROFILE: ${VOLTHIVE_GENERATOR_PROFILE:-default}
-    PYTHONPATH: /opt/airflow/src
+    # TWO entries, and the second one is load-bearing.
+    #
+    #   /opt/airflow/src   makes `import volthive` work.
+    #   /opt/airflow       makes `import dags.common...` work.
+    #
+    # Every DAG imports its shared helpers as `from dags.common.datasets
+    # import ...` - a package rooted at the REPOSITORY, not at the DAGs
+    # folder. Airflow puts the DAGs folder itself on sys.path, which resolves
+    # `common.datasets` but not `dags.common.datasets`; for that, the parent
+    # of dags/ has to be importable too.
+    #
+    # Without it the scheduler reports, for all four DAGs and for
+    # dags/common/default_args.py:
+    #
+    #   ModuleNotFoundError: No module named 'dags'
+    #
+    # which the UI shows as "DAG Import Errors (5)" and zero DAGs. The test
+    # suite could not catch it, because pytest runs with the repository root
+    # already on sys.path - so the tests validated a path shape the container
+    # never has. tests/dags/test_container_import_path.py now reproduces the
+    # container's sys.path exactly, deriving it from THIS value.
+    PYTHONPATH: /opt/airflow/src:/opt/airflow
   volumes:
     # Read-only wherever the container has no business writing.
     - ./dags:/opt/airflow/dags:ro
     - ./src:/opt/airflow/src:ro
     - ./sql:/opt/airflow/sql:ro
     - ./configs:/opt/airflow/configs:ro
+    # The operator entry points - apply_schema, generate_data, run_pipeline,
+    # restate, dq_report and friends. Mounted so `make run` and the rest of the
+    # warehouse lifecycle can execute INSIDE this image, which is the only
+    # place the project's Python dependencies are installed. Read-only: these
+    # are inputs to the container, never something it should rewrite.
+    - ./scripts:/opt/airflow/scripts:ro
     # Writable: the landing zone the generator produces and ingestion reads.
     - ./data:/opt/airflow/data
     # Named volume: logs must survive a restart but must not pollute the repo.
