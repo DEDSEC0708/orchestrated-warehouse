@@ -11,7 +11,7 @@
 # only one of them would let the other drift and silently invalidate
 # constraints.txt. See docs/adr/012-airflow-version.md.
 # =============================================================================
-FROM apache/airflow:2.10.5-python3.11
+FROM apache/airflow:3.3.1-python3.11
 
 # --- system packages -------------------------------------------------------
 # postgresql-client : psql for the healthcheck fallback and manual debugging
