@@ -17,8 +17,8 @@
 
 # --- Orchestration ---------------------------------------------------------
 # Pinned exactly. See docs/adr/012-airflow-version.md for why 2.10.5 and not 3.x.
-apache-airflow==2.10.5
-apache-airflow-providers-postgres==6.0.0
+apache-airflow==3.3.2
+apache-airflow-providers-postgres==7.0.2
 
 # --- Database access -------------------------------------------------------
 # psycopg 3 is used by our own pipeline code (src/volthive) for COPY-based bulk
