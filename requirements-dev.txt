@@ -29,7 +29,7 @@ respx==0.22.0      # httpx transport mocking for the partner API client
 ruff               # (constraints) 0.5.5 - linter + formatter
 mypy               # (constraints) 1.9.0
 types-PyYAML       # (constraints) 6.0.12.20241230
-sqlfluff==3.4.2    # SQL linter (not an Airflow dependency, so pinned here)
+sqlfluff==4.3.0    # SQL linter (not an Airflow dependency, so pinned here)
 
 # --- Git hooks -------------------------------------------------------------
 # NOTE: the constraints file lists this under its normalised name `pre_commit`
